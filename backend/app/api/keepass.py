@@ -5,10 +5,29 @@ from sqlalchemy import select, or_, and_
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
+import base64
+import hashlib
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.db.session import get_db
 from app.models.models import KeepassVault, KeepassShare, User
 from app.core.security import require_admin
+from app.core.config import settings
+
+
+def _fernet() -> Fernet:
+    # Derive a stable 32-byte key from the platform SECRET_KEY.
+    digest = hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_secret(s: str) -> str:
+    return _fernet().encrypt(s.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(token: str) -> str:
+    return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
 
 # Admin-only — KeePass vaults are a sensitive admin feature.
 router = APIRouter(prefix="/api/keepass", tags=["keepass"])
@@ -24,6 +43,7 @@ class VaultOut(BaseModel):
     owner_username: Optional[str] = None
     can_edit: bool = True
     is_owner: bool = True
+    has_stored_master: bool = False  # only meaningful for owner
     shared_with: list[dict] = []
     updated_at: Optional[datetime]
     created_at: Optional[datetime]
@@ -68,6 +88,7 @@ async def _vault_to_out(v: KeepassVault, db: AsyncSession, current_user: User) -
         id=v.id, name=v.name, size_bytes=v.size_bytes,
         owner_user_id=v.owner_user_id, owner_username=owner.username if owner else None,
         is_owner=is_owner, can_edit=can_edit,
+        has_stored_master=bool(v.owner_master_enc) if is_owner else False,
         shared_with=shares, updated_at=v.updated_at, created_at=v.created_at,
     )
 
@@ -96,6 +117,7 @@ async def list_vaults(db: AsyncSession = Depends(get_db), user: User = Depends(r
 async def upload_vault(
     name: str = Form(...),
     file: UploadFile = File(...),
+    remember_master: Optional[str] = Form(None),  # plain master password to store encrypted
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -105,6 +127,8 @@ async def upload_vault(
     if not blob:
         raise HTTPException(400, "Empty file")
     v = KeepassVault(owner_user_id=user.id, name=name, blob=blob, size_bytes=len(blob))
+    if remember_master:
+        v.owner_master_enc = encrypt_secret(remember_master)
     db.add(v)
     await db.flush()
     await db.refresh(v)
@@ -179,6 +203,48 @@ async def add_share(vault_id: int, data: ShareIn, db: AsyncSession = Depends(get
         existing.can_edit = data.can_edit
     else:
         db.add(KeepassShare(vault_id=vault_id, user_id=data.user_id, can_edit=data.can_edit))
+    await db.flush()
+    await db.refresh(v)
+    return await _vault_to_out(v, db, user)
+
+
+class MasterIn(BaseModel):
+    password: str
+
+
+@router.get("/{vault_id}/master")
+async def get_stored_master(vault_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)):
+    v = await db.get(KeepassVault, vault_id)
+    if not v or v.owner_user_id != user.id:
+        # Only owners can ever read their stored master pwd; sharees must use OOB.
+        raise HTTPException(404, "Vault not found")
+    if not v.owner_master_enc:
+        raise HTTPException(404, "No stored master password")
+    try:
+        return {"password": decrypt_secret(v.owner_master_enc)}
+    except InvalidToken:
+        raise HTTPException(500, "Stored master is unreadable (SECRET_KEY changed?)")
+
+
+@router.post("/{vault_id}/master", response_model=VaultOut)
+async def set_stored_master(vault_id: int, data: MasterIn, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)):
+    v = await db.get(KeepassVault, vault_id)
+    if not v or v.owner_user_id != user.id:
+        raise HTTPException(404, "Vault not found")
+    if not data.password:
+        raise HTTPException(400, "Password required")
+    v.owner_master_enc = encrypt_secret(data.password)
+    await db.flush()
+    await db.refresh(v)
+    return await _vault_to_out(v, db, user)
+
+
+@router.delete("/{vault_id}/master", response_model=VaultOut)
+async def clear_stored_master(vault_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)):
+    v = await db.get(KeepassVault, vault_id)
+    if not v or v.owner_user_id != user.id:
+        raise HTTPException(404, "Vault not found")
+    v.owner_master_enc = None
     await db.flush()
     await db.refresh(v)
     return await _vault_to_out(v, db, user)

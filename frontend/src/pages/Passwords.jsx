@@ -5,12 +5,14 @@ import { saveAs } from 'file-saver'
 import {
   Plus, Upload, Download, Trash2, Lock, Unlock, ShieldCheck, Share2,
   KeyRound, Eye, EyeOff, Copy, FolderPlus, Folder,
-  ArrowLeft, Save, Search, Edit3, RefreshCw,
+  ArrowLeft, Save, Search, Edit3, RefreshCw, Sparkles,
 } from 'lucide-react'
+import PasswordGeneratorModal from '../components/PasswordGenerator'
 
 import {
   getVaults, uploadVault, downloadVaultBlob, updateVaultBlob, renameVault, deleteVault,
   shareVault, unshareVault, getUsers,
+  getStoredMaster, setStoredMaster, clearStoredMaster,
 } from '../api/client'
 import { Btn, Modal, Spinner, Field, Badge } from '../components/ui/index'
 import { useDeleteOtp } from '../context/DeleteOtpContext'
@@ -36,6 +38,7 @@ function VaultList({ onOpen }) {
   const [createModal, setCreateModal] = useState(false)
   const [openModal, setOpenModal] = useState(null) // vault meta to prompt password
   const [shareModal, setShareModal] = useState(null)
+  const [autoOpeningId, setAutoOpeningId] = useState(null)
 
   const { data: vaults = [], isLoading } = useQuery({
     queryKey: ['vaults'],
@@ -46,6 +49,31 @@ function VaultList({ onOpen }) {
     mutationFn: deleteVault,
     onSuccess: () => { toast.success('Сейф видалено'); qc.invalidateQueries(['vaults']) },
   })
+
+  const clearMasterMut = useMutation({
+    mutationFn: clearStoredMaster,
+    onSuccess: () => { toast.success('Запам\'ятований пароль очищено'); qc.invalidateQueries(['vaults']) },
+  })
+
+  async function attemptOpen(vault) {
+    // Owner with saved master → try transparent open
+    if (vault.is_owner && vault.has_stored_master) {
+      setAutoOpeningId(vault.id)
+      try {
+        const m = await getStoredMaster(vault.id)
+        const blobResp = await downloadVaultBlob(vault.id)
+        const db = await openKdbx(blobResp.data, m.data.password)
+        onOpen({ meta: vault, db, masterPwd: m.data.password })
+        return
+      } catch (e) {
+        // Stored master invalid (e.g. file re-encrypted) — clear and fall back
+        toast.error('Збережений пароль не підійшов — введіть знову')
+        try { await clearStoredMaster(vault.id) } catch {}
+        qc.invalidateQueries(['vaults'])
+      } finally { setAutoOpeningId(null) }
+    }
+    setOpenModal(vault)
+  }
 
   return (
     <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16, height: '100%', overflow: 'hidden' }}>
@@ -74,9 +102,11 @@ function VaultList({ onOpen }) {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 10, padding: 8 }}>
               {vaults.map(v => (
                 <VaultCard key={v.id} vault={v}
-                  onOpen={() => setOpenModal(v)}
+                  busy={autoOpeningId === v.id}
+                  onOpen={() => attemptOpen(v)}
                   onShare={() => setShareModal(v)}
                   onDelete={() => gateDelete(() => delMut.mutateAsync(v.id)).catch(() => {})}
+                  onForgetMaster={() => clearMasterMut.mutate(v.id)}
                 />
               ))}
             </div>
@@ -92,21 +122,34 @@ function VaultList({ onOpen }) {
   )
 }
 
-function VaultCard({ vault, onOpen, onShare, onDelete }) {
+function VaultCard({ vault, busy, onOpen, onShare, onDelete, onForgetMaster }) {
   return (
-    <div onClick={onOpen} style={{
+    <div onClick={busy ? undefined : onOpen} style={{
       background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 12,
-      padding: 14, cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 10,
-      transition: 'all 0.15s',
+      padding: 14, cursor: busy ? 'wait' : 'pointer', display: 'flex', flexDirection: 'column', gap: 10,
+      transition: 'all 0.15s', opacity: busy ? 0.7 : 1,
     }}
-      onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--border2)'; e.currentTarget.style.transform = 'translateY(-1px)' }}
+      onMouseEnter={e => { if (!busy) { e.currentTarget.style.borderColor = 'var(--border2)'; e.currentTarget.style.transform = 'translateY(-1px)' } }}
       onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.transform = 'none' }}
     >
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ width: 36, height: 36, borderRadius: 8, background: 'var(--accent-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <Lock size={17} style={{ color: 'var(--accent)' }} />
+        <div style={{
+          width: 36, height: 36, borderRadius: 8,
+          background: vault.is_owner && vault.has_stored_master ? 'var(--green-dim)' : 'var(--accent-dim)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          {vault.is_owner && vault.has_stored_master
+            ? <Unlock size={17} style={{ color: 'var(--green)' }} />
+            : <Lock size={17} style={{ color: 'var(--accent)' }} />}
         </div>
         <div style={{ display: 'flex', gap: 4 }} onClick={e => e.stopPropagation()}>
+          {vault.is_owner && vault.has_stored_master && (
+            <button onClick={onForgetMaster} title="Забути збережений мастер-пароль"
+              style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 4, borderRadius: 4 }}
+              onMouseEnter={e => e.currentTarget.style.color = 'var(--yellow)'}
+              onMouseLeave={e => e.currentTarget.style.color = 'var(--text3)'}
+            ><KeyRound size={13} /></button>
+          )}
           {vault.is_owner && (
             <button onClick={onShare} title="Поділитися"
               style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 4, borderRadius: 4 }}
@@ -127,6 +170,7 @@ function VaultCard({ vault, onOpen, onShare, onDelete }) {
         {vault.name}
       </div>
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {vault.is_owner && vault.has_stored_master && <Badge color="green"><Unlock size={9} /> Авто-відкриття</Badge>}
         {!vault.is_owner && <Badge color="blue">Спільний від {vault.owner_username}</Badge>}
         {!vault.can_edit && !vault.is_owner && <Badge color="default">Read-only</Badge>}
         {vault.shared_with?.length > 0 && vault.is_owner && (
@@ -145,15 +189,22 @@ function VaultCard({ vault, onOpen, onShare, onDelete }) {
 function UploadVaultModal({ open, onClose, onDone }) {
   const [name, setName] = useState('')
   const [file, setFile] = useState(null)
+  const [master, setMaster] = useState('')
+  const [remember, setRemember] = useState(true)
   const [loading, setLoading] = useState(false)
-  useEffect(() => { if (open) { setName(''); setFile(null) } }, [open])
+  useEffect(() => { if (open) { setName(''); setFile(null); setMaster(''); setRemember(true) } }, [open])
 
   async function submit() {
     if (!file || !name.trim()) return
+    if (remember && !master) return toast.error('Введіть мастер-пароль або зніміть «запамʼятати»')
     setLoading(true)
-    try { await uploadVault(name.trim(), file); toast.success('Сейф завантажено'); onDone(); onClose() }
-    catch (e) { toast.error('Помилка: ' + (e.response?.data?.detail || e.message)) }
-    finally { setLoading(false) }
+    try {
+      await uploadVault(name.trim(), file, remember ? master : null)
+      toast.success('Сейф завантажено')
+      onDone(); onClose()
+    } catch (e) {
+      toast.error('Помилка: ' + (e.response?.data?.detail || e.message))
+    } finally { setLoading(false) }
   }
 
   return (
@@ -165,8 +216,17 @@ function UploadVaultModal({ open, onClose, onDone }) {
         <Field label="Файл .kdbx">
           <input type="file" accept=".kdbx" onChange={e => setFile(e.target.files?.[0] || null)} />
         </Field>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, cursor: 'pointer' }}>
+          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} style={{ width: 'auto' }} />
+          Запамʼятати мастер-пароль (відкривати без запиту)
+        </label>
+        {remember && (
+          <Field label="Мастер-пароль">
+            <input type="password" value={master} onChange={e => setMaster(e.target.value)} />
+          </Field>
+        )}
         <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
-          Файл уже зашифрований мастер-паролем. Сервер зберігає його як є.
+          Файл уже зашифрований мастер-паролем. Якщо «запамʼятати» — пароль зберігається на сервері (шифр Fernet від SECRET_KEY), доступний лише вам. Якщо ділитеся з кимось — їм пароль все одно потрібен.
         </p>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
@@ -181,8 +241,9 @@ function CreateVaultModal({ open, onClose, onDone }) {
   const [name, setName] = useState('')
   const [pwd, setPwd] = useState('')
   const [pwd2, setPwd2] = useState('')
+  const [remember, setRemember] = useState(true)
   const [loading, setLoading] = useState(false)
-  useEffect(() => { if (open) { setName(''); setPwd(''); setPwd2('') } }, [open])
+  useEffect(() => { if (open) { setName(''); setPwd(''); setPwd2(''); setRemember(true) } }, [open])
 
   async function submit() {
     if (pwd !== pwd2) return toast.error('Паролі не співпадають')
@@ -192,7 +253,7 @@ function CreateVaultModal({ open, onClose, onDone }) {
       const db = await createBlankKdbx(name, pwd)
       const buf = await saveKdbx(db)
       const file = new File([buf], `${name}.kdbx`, { type: 'application/octet-stream' })
-      await uploadVault(name.trim(), file)
+      await uploadVault(name.trim(), file, remember ? pwd : null)
       toast.success('Сейф створено')
       onDone(); onClose()
     } catch (e) {
@@ -212,8 +273,14 @@ function CreateVaultModal({ open, onClose, onDone }) {
         <Field label="Повторіть мастер-пароль">
           <input type="password" value={pwd2} onChange={e => setPwd2(e.target.value)} />
         </Field>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, cursor: 'pointer' }}>
+          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} style={{ width: 'auto' }} />
+          Запамʼятати мастер-пароль (без запиту з будь-якого пристрою)
+        </label>
         <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
-          Мастер-пароль не відновлюється. Запам'ятайте або збережіть у надійному місці.
+          {remember
+            ? 'Пароль збережеться на сервері в шифрованому вигляді (Fernet від SECRET_KEY). Якщо поділитесь сейфом з кимось — їм все одно потрібен пароль.'
+            : 'Мастер-пароль не відновлюється. Запамʼятайте або збережіть у надійному місці.'}
         </p>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
@@ -225,9 +292,11 @@ function CreateVaultModal({ open, onClose, onDone }) {
 }
 
 function OpenVaultModal({ vault, onClose, onOpened }) {
+  const qc = useQueryClient()
   const [pwd, setPwd] = useState('')
+  const [remember, setRemember] = useState(true)
   const [loading, setLoading] = useState(false)
-  useEffect(() => { if (vault) setPwd('') }, [vault])
+  useEffect(() => { if (vault) { setPwd(''); setRemember(vault.is_owner) } }, [vault])
 
   async function submit() {
     if (!pwd) return
@@ -235,6 +304,13 @@ function OpenVaultModal({ vault, onClose, onOpened }) {
     try {
       const r = await downloadVaultBlob(vault.id)
       const db = await openKdbx(r.data, pwd)
+      // Only owners can persist the master server-side
+      if (vault.is_owner && remember) {
+        try {
+          await setStoredMaster(vault.id, pwd)
+          qc.invalidateQueries(['vaults'])
+        } catch { /* non-fatal */ }
+      }
       onOpened({ meta: vault, db, masterPwd: pwd })
       onClose()
     } catch (e) {
@@ -249,6 +325,12 @@ function OpenVaultModal({ vault, onClose, onOpened }) {
           <input autoFocus type="password" value={pwd} onChange={e => setPwd(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && submit()} />
         </Field>
+        {vault?.is_owner && (
+          <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, cursor: 'pointer' }}>
+            <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} style={{ width: 'auto' }} />
+            Запамʼятати мастер-пароль (відкривати без запиту з будь-якого пристрою)
+          </label>
+        )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
           <Btn loading={loading} disabled={!pwd} onClick={submit}><Unlock size={14} /> Відкрити</Btn>
@@ -332,6 +414,7 @@ function VaultEditor({ vault, onClose }) {
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [search, setSearch] = useState('')
+  const [genOpen, setGenOpen] = useState(false)
   const canEdit = meta.can_edit
 
   const groups = useMemo(() => listGroups(db), [db, version])
@@ -466,6 +549,7 @@ function VaultEditor({ vault, onClose }) {
         </div>
         {dirty && <span style={{ fontSize: 11, color: 'var(--yellow)' }}>● незбережено</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <Btn size="sm" variant="ghost" onClick={() => setGenOpen(true)}><Sparkles size={13} /> Генератор</Btn>
           <Btn size="sm" variant="ghost" onClick={downloadFile}><Download size={13} /> Завантажити .kdbx</Btn>
           {canEdit && (
             <Btn size="sm" loading={saving} onClick={save}><Save size={13} /> Зберегти</Btn>
@@ -574,6 +658,7 @@ function VaultEditor({ vault, onClose }) {
       </div>
 
       <EntryModal modal={entryModal} onClose={() => setEntryModal(null)} onSave={saveEntry} />
+      <PasswordGeneratorModal open={genOpen} onClose={() => setGenOpen(false)} />
     </div>
   )
 }
@@ -654,6 +739,7 @@ function DetailRow({ label, value, mono, onCopy, extra }) {
 function EntryModal({ modal, onClose, onSave }) {
   const [form, setForm] = useState({ title: '', username: '', password: '', url: '', notes: '' })
   const [showPwd, setShowPwd] = useState(false)
+  const [genOpen, setGenOpen] = useState(false)
 
   useEffect(() => {
     if (!modal) return
@@ -684,8 +770,11 @@ function EntryModal({ modal, onClose, onSave }) {
             <Btn size="sm" variant="ghost" onClick={() => setShowPwd(s => !s)} title={showPwd ? 'Сховати' : 'Показати'}>
               {showPwd ? <EyeOff size={13} /> : <Eye size={13} />}
             </Btn>
-            <Btn size="sm" variant="ghost" onClick={() => setForm(f => ({ ...f, password: generatePassword(20) }))} title="Згенерувати">
+            <Btn size="sm" variant="ghost" onClick={() => setForm(f => ({ ...f, password: generatePassword(20) }))} title="Швидко: 20 символів">
               <RefreshCw size={13} />
+            </Btn>
+            <Btn size="sm" variant="ghost" onClick={() => setGenOpen(true)} title="Розширений генератор">
+              <Sparkles size={13} />
             </Btn>
           </div>
         </Field>
@@ -698,6 +787,8 @@ function EntryModal({ modal, onClose, onSave }) {
           <Btn disabled={!form.title.trim()} onClick={() => onSave(form)}><Save size={13} /> Зберегти</Btn>
         </div>
       </div>
+      <PasswordGeneratorModal open={genOpen} onClose={() => setGenOpen(false)}
+        onUse={(p) => setForm(f => ({ ...f, password: p }))} />
     </Modal>
   )
 }

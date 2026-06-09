@@ -28,7 +28,7 @@ from app.models.models import (
     User, Team, CloudflareAccount, KeitaroInstance, KeitaroDomainGroup,
     Domain, DnsRecord, AbuseAlert, ActionLog, TelegramAdmin,
     Spreadsheet, KeepassVault, KeepassShare, Proxy,
-    BackupConfig, BackupRun, Purchase, KumaInstance,
+    BackupConfig, BackupRun, Purchase, KumaInstance, Identity,
 )
 
 BACKUP_VERSION = 1
@@ -52,6 +52,7 @@ EXPORTED_TABLES = [
     ("proxies",                Proxy,                None, set()),
     ("purchases",              Purchase,             None, set()),
     ("kuma_instances",         KumaInstance,         None, set()),
+    ("identities",             Identity,             None, set()),
     ("backup_config",          BackupConfig,         None, set()),
     # NOTE: backup_runs intentionally excluded — meta about backups themselves
 ]

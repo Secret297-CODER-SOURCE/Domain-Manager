@@ -6,7 +6,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -105,6 +105,13 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE telegram_admins ALTER COLUMN chat_id DROP NOT NULL",
             "ALTER TABLE telegram_admins ADD COLUMN IF NOT EXISTS username VARCHAR(64) UNIQUE",
             "ALTER TABLE domains ADD COLUMN IF NOT EXISTS name_servers VARCHAR(512)",
+            "ALTER TABLE spreadsheets ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'local'",
+            "ALTER TABLE spreadsheets ADD COLUMN IF NOT EXISTS external_url VARCHAR(1024)",
+            "ALTER TABLE identities ADD COLUMN IF NOT EXISTS email VARCHAR(256)",
+            "ALTER TABLE identities ADD COLUMN IF NOT EXISTS username VARCHAR(128)",
+            "ALTER TABLE identities ADD COLUMN IF NOT EXISTS password VARCHAR(256)",
+            "ALTER TABLE identities ADD COLUMN IF NOT EXISTS picture VARCHAR(512)",
+            "ALTER TABLE keepass_vaults ADD COLUMN IF NOT EXISTS owner_master_enc TEXT",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))
@@ -181,6 +188,7 @@ app.include_router(proxies.router)
 app.include_router(backup_api.router)
 app.include_router(purchases.router)
 app.include_router(kuma.router)
+app.include_router(identities.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

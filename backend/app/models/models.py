@@ -155,11 +155,14 @@ class ActionLog(Base):
 
 
 class Spreadsheet(Base):
-    """Editable spreadsheet doc. data = JSON serialized fortune-sheet workbook."""
+    """Editable spreadsheet doc. data = JSON serialized fortune-sheet workbook.
+    kind='google' = external Google Sheets, data unused, external_url holds the share URL."""
     __tablename__ = "spreadsheets"
     id = Column(Integer, primary_key=True)
     owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(256), nullable=False)
+    kind = Column(String(16), nullable=False, default="local")  # local | google
+    external_url = Column(String(1024), nullable=True)
     data = Column(Text, nullable=False, default="[]")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
@@ -173,6 +176,9 @@ class KeepassVault(Base):
     name = Column(String(256), nullable=False)
     blob = Column(LargeBinary, nullable=False)
     size_bytes = Column(Integer, nullable=False, default=0)
+    # Optional: master password encrypted by the platform secret. Only the owner can
+    # retrieve it. If set, owner gets passwordless open. Shared users never see it.
+    owner_master_enc = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
@@ -231,6 +237,37 @@ class Purchase(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class Identity(Base):
+    """Saved generated fake identity (for QA / test data)."""
+    __tablename__ = "identities"
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    country_code = Column(String(8), nullable=False)
+    full_name = Column(String(256), nullable=True)
+    gender = Column(String(16), nullable=True)
+    birthday = Column(String(32), nullable=True)
+    ssn = Column(String(64), nullable=True)
+    phone = Column(String(64), nullable=True)
+    email = Column(String(256), nullable=True)
+    username = Column(String(128), nullable=True)
+    password = Column(String(256), nullable=True)
+    picture = Column(String(512), nullable=True)
+    card_brand = Column(String(32), nullable=True)
+    card_number = Column(String(32), nullable=True)
+    card_expire = Column(String(16), nullable=True)
+    card_cvv = Column(String(8), nullable=True)
+    street = Column(String(256), nullable=True)
+    city = Column(String(128), nullable=True)
+    region = Column(String(128), nullable=True)
+    zip_code = Column(String(32), nullable=True)
+    country_full = Column(String(128), nullable=True)
+    latitude = Column(String(32), nullable=True)
+    longitude = Column(String(32), nullable=True)
+    notes = Column(Text, nullable=True)
+    label = Column(String(128), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class KumaInstance(Base):

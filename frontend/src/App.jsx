@@ -20,6 +20,7 @@ import ProxiesPage from './pages/Proxies'
 import BackupPage from './pages/Backup'
 import PurchasesPage from './pages/Purchases'
 import KumaPage from './pages/Kuma'
+import IdentitiesPage from './pages/Identities'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
@@ -60,6 +61,7 @@ export default function App() {
               <Route path="proxies"   element={<ProxiesPage />} />
               <Route path="purchases" element={<PurchasesPage />} />
               <Route path="kuma"      element={<KumaPage />} />
+              <Route path="identities" element={<IdentitiesPage />} />
               <Route path="passwords" element={<RequireAdmin><PasswordsPage /></RequireAdmin>} />
               <Route path="backup"    element={<RequireAdmin><BackupPage /></RequireAdmin>} />
               <Route path="settings"  element={<RequireAdmin><SettingsPage /></RequireAdmin>} />

@@ -122,15 +122,20 @@ export const createSheet = (data) => api.post('/sheets', data)
 export const getSheet = (id) => api.get(`/sheets/${id}`)
 export const updateSheet = (id, data) => api.patch(`/sheets/${id}`, data)
 export const deleteSheet = (id) => api.delete(`/sheets/${id}`)
+export const renameSheet = (id, name) => api.patch(`/sheets/${id}`, { name })
 
 // KeePass vaults
 export const getVaults = () => api.get('/keepass')
-export const uploadVault = (name, file) => {
+export const uploadVault = (name, file, rememberMaster) => {
   const fd = new FormData()
   fd.append('name', name)
   fd.append('file', file)
+  if (rememberMaster) fd.append('remember_master', rememberMaster)
   return api.post('/keepass', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
 }
+export const getStoredMaster = (vaultId) => api.get(`/keepass/${vaultId}/master`)
+export const setStoredMaster = (vaultId, password) => api.post(`/keepass/${vaultId}/master`, { password })
+export const clearStoredMaster = (vaultId) => api.delete(`/keepass/${vaultId}/master`)
 export const updateVaultBlob = (id, file) => {
   const fd = new FormData()
   fd.append('file', file)
@@ -183,6 +188,16 @@ export const getPurchases = () => api.get('/purchases')
 export const createPurchase = (data) => api.post('/purchases', data)
 export const updatePurchase = (id, data) => api.patch(`/purchases/${id}`, data)
 export const deletePurchase = (id) => api.delete(`/purchases/${id}`)
+
+// Identities (fake-identity generator)
+export const getIdentityLocations = () => api.get('/identities/locations')
+export const generateIdentity = (loc = 'random') => api.post(`/identities/generate?loc=${encodeURIComponent(loc)}`)
+export const generateIdentityBulk = (loc = 'random', count = 5) =>
+  api.post(`/identities/generate-bulk?loc=${encodeURIComponent(loc)}&count=${count}`)
+export const listSavedIdentities = () => api.get('/identities/saved')
+export const saveIdentity = (data) => api.post('/identities/saved', data)
+export const patchSavedIdentity = (id, data) => api.patch(`/identities/saved/${id}`, data)
+export const deleteSavedIdentity = (id) => api.delete(`/identities/saved/${id}`)
 
 // Uptime Kuma
 export const getKumaInstances = () => api.get('/kuma')

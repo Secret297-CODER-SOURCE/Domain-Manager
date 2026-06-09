@@ -15,6 +15,8 @@ router = APIRouter(prefix="/api/sheets", tags=["sheets"])
 class SheetMeta(BaseModel):
     id: int
     name: str
+    kind: str = "local"
+    external_url: Optional[str] = None
     is_encrypted: bool = False
     updated_at: Optional[datetime]
     created_at: Optional[datetime]
@@ -29,6 +31,7 @@ class SheetFull(SheetMeta):
 def _to_meta(s: Spreadsheet) -> SheetMeta:
     return SheetMeta(
         id=s.id, name=s.name,
+        kind=s.kind or "local", external_url=s.external_url,
         is_encrypted=bool(s.data and s.data.startswith("ENC1:")),
         updated_at=s.updated_at, created_at=s.created_at,
     )
@@ -37,6 +40,7 @@ def _to_meta(s: Spreadsheet) -> SheetMeta:
 def _to_full(s: Spreadsheet) -> SheetFull:
     return SheetFull(
         id=s.id, name=s.name, data=s.data,
+        kind=s.kind or "local", external_url=s.external_url,
         is_encrypted=bool(s.data and s.data.startswith("ENC1:")),
         updated_at=s.updated_at, created_at=s.created_at,
     )
@@ -45,11 +49,14 @@ def _to_full(s: Spreadsheet) -> SheetFull:
 class SheetCreate(BaseModel):
     name: str
     data: Optional[str] = None
+    kind: Optional[str] = "local"
+    external_url: Optional[str] = None
 
 
 class SheetUpdate(BaseModel):
     name: Optional[str] = None
     data: Optional[str] = None
+    external_url: Optional[str] = None
 
 
 @router.get("", response_model=list[SheetMeta])
@@ -60,7 +67,13 @@ async def list_sheets(db: AsyncSession = Depends(get_db), user: User = Depends(g
 
 @router.post("", response_model=SheetFull)
 async def create_sheet(data: SheetCreate, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
-    s = Spreadsheet(owner_user_id=user.id, name=data.name or "Без назви", data=data.data or "[]")
+    s = Spreadsheet(
+        owner_user_id=user.id,
+        name=data.name or "Без назви",
+        kind=(data.kind or "local"),
+        external_url=data.external_url,
+        data=data.data or "[]",
+    )
     db.add(s)
     await db.flush()
     await db.refresh(s)
@@ -84,6 +97,8 @@ async def update_sheet(sheet_id: int, data: SheetUpdate, db: AsyncSession = Depe
         s.name = data.name
     if data.data is not None:
         s.data = data.data
+    if data.external_url is not None:
+        s.external_url = data.external_url
     await db.flush()
     await db.refresh(s)
     return _to_full(s)

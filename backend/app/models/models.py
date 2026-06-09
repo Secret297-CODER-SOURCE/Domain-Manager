@@ -239,6 +239,27 @@ class Purchase(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
+class MailAccount(Base):
+    """IMAP-only mailbox (read-only viewing for now)."""
+    __tablename__ = "mail_accounts"
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(128), nullable=True)
+    email = Column(String(256), nullable=False)
+    imap_host = Column(String(256), nullable=False)
+    imap_port = Column(Integer, nullable=False, default=993)
+    imap_ssl = Column(Boolean, nullable=False, default=True)
+    username = Column(String(256), nullable=False)
+    # Encrypted with platform SECRET_KEY (Fernet)
+    password_enc = Column(Text, nullable=False)
+    last_check_at = Column(DateTime(timezone=True), nullable=True)
+    last_unread = Column(Integer, nullable=True)
+    last_total = Column(Integer, nullable=True)
+    last_error = Column(String(512), nullable=True)
+    color = Column(String(16), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Identity(Base):
     """Saved generated fake identity (for QA / test data)."""
     __tablename__ = "identities"

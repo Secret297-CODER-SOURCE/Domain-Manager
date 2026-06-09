@@ -5,29 +5,10 @@ from sqlalchemy import select, or_, and_
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
-import base64
-import hashlib
-
-from cryptography.fernet import Fernet, InvalidToken
-
 from app.db.session import get_db
 from app.models.models import KeepassVault, KeepassShare, User
 from app.core.security import require_admin
-from app.core.config import settings
-
-
-def _fernet() -> Fernet:
-    # Derive a stable 32-byte key from the platform SECRET_KEY.
-    digest = hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
-
-
-def encrypt_secret(s: str) -> str:
-    return _fernet().encrypt(s.encode("utf-8")).decode("ascii")
-
-
-def decrypt_secret(token: str) -> str:
-    return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
+from app.core.crypto import encrypt_secret, decrypt_secret, InvalidToken
 
 # Admin-only — KeePass vaults are a sensitive admin feature.
 router = APIRouter(prefix="/api/keepass", tags=["keepass"])

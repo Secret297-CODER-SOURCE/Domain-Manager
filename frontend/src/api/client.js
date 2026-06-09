@@ -182,12 +182,29 @@ export const doBackupRestore = (file, password, mode) => {
   fd.append('mode', mode)
   return api.post('/backup/restore', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
 }
+export const listSftpBackups = () => api.get('/backup/sftp/list')
+export const previewSftpBackup = (filename, password) =>
+  api.post('/backup/sftp/preview', { filename, password: password || '' })
+export const restoreFromSftp = (filename, password, mode) =>
+  api.post('/backup/sftp/restore', { filename, password: password || '', mode })
 
 // Purchases
 export const getPurchases = () => api.get('/purchases')
 export const createPurchase = (data) => api.post('/purchases', data)
 export const updatePurchase = (id, data) => api.patch(`/purchases/${id}`, data)
 export const deletePurchase = (id) => api.delete(`/purchases/${id}`)
+
+// Mail (IMAP)
+export const getMailPresets = () => api.get('/mail/presets')
+export const getMailAccounts = () => api.get('/mail')
+export const testMailAccount = (data) => api.post('/mail/test', data)
+export const createMailAccount = (data) => api.post('/mail', data)
+export const updateMailAccount = (id, data) => api.patch(`/mail/${id}`, data)
+export const deleteMailAccount = (id) => api.delete(`/mail/${id}`)
+export const refreshMailAccount = (id) => api.post(`/mail/${id}/check`)
+export const refreshAllMail = () => api.post('/mail/check-all')
+export const listMailMessages = (id, limit = 50) => api.get(`/mail/${id}/messages`, { params: { limit } })
+export const getMailMessage = (id, uid) => api.get(`/mail/${id}/messages/${uid}`)
 
 // Identities (fake-identity generator)
 export const getIdentityLocations = () => api.get('/identities/locations')

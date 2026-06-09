@@ -311,6 +311,74 @@ async def restore_backup(
     return {"ok": True, "mode": mode, "manifest": parsed["manifest"], "stats": stats}
 
 
+# ── SFTP restore ──────────────────────────────────────────────────────────
+
+@router.get("/sftp/list")
+async def list_sftp(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    c = await _get_or_create_config(db)
+    if not (c.sftp_host and c.sftp_username and c.sftp_password):
+        raise HTTPException(400, "SFTP не налаштовано (host/username/password)")
+    try:
+        files = await bkp.list_sftp_backups(
+            c.sftp_host, c.sftp_port or 22, c.sftp_username, c.sftp_password, c.sftp_path or "/",
+        )
+    except Exception as e:
+        raise HTTPException(502, f"SFTP error: {e}")
+    return {"path": c.sftp_path or "/", "files": files}
+
+
+class SftpPreviewIn(BaseModel):
+    filename: str
+    password: Optional[str] = ""
+
+
+@router.post("/sftp/preview")
+async def sftp_preview(data: SftpPreviewIn, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    c = await _get_or_create_config(db)
+    if not (c.sftp_host and c.sftp_username and c.sftp_password):
+        raise HTTPException(400, "SFTP не налаштовано")
+    try:
+        content = await bkp.download_from_sftp(
+            c.sftp_host, c.sftp_port or 22, c.sftp_username, c.sftp_password,
+            c.sftp_path or "/", data.filename,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"SFTP download failed: {e}")
+    try:
+        parsed = bkp.parse_archive(content, data.password or None)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    return {"manifest": parsed["manifest"]}
+
+
+class SftpRestoreIn(BaseModel):
+    filename: str
+    password: Optional[str] = ""
+    mode: str = "merge"
+
+
+@router.post("/sftp/restore")
+async def sftp_restore(data: SftpRestoreIn, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    if data.mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be merge|replace")
+    c = await _get_or_create_config(db)
+    if not (c.sftp_host and c.sftp_username and c.sftp_password):
+        raise HTTPException(400, "SFTP не налаштовано")
+    try:
+        content = await bkp.download_from_sftp(
+            c.sftp_host, c.sftp_port or 22, c.sftp_username, c.sftp_password,
+            c.sftp_path or "/", data.filename,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"SFTP download failed: {e}")
+    try:
+        parsed = bkp.parse_archive(content, data.password or None)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    stats = await bkp.restore_data(parsed, db, mode=data.mode)
+    return {"ok": True, "mode": data.mode, "manifest": parsed["manifest"], "stats": stats, "source": "sftp", "filename": data.filename}
+
+
 # ── Scheduler entry-point (called by main.py job) ─────────────────────────
 
 async def scheduled_backup_job():

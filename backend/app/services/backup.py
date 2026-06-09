@@ -28,7 +28,7 @@ from app.models.models import (
     User, Team, CloudflareAccount, KeitaroInstance, KeitaroDomainGroup,
     Domain, DnsRecord, AbuseAlert, ActionLog, TelegramAdmin,
     Spreadsheet, KeepassVault, KeepassShare, Proxy,
-    BackupConfig, BackupRun, Purchase, KumaInstance, Identity,
+    BackupConfig, BackupRun, Purchase, KumaInstance, Identity, MailAccount,
 )
 
 BACKUP_VERSION = 1
@@ -53,6 +53,7 @@ EXPORTED_TABLES = [
     ("purchases",              Purchase,             None, set()),
     ("kuma_instances",         KumaInstance,         None, set()),
     ("identities",             Identity,             None, set()),
+    ("mail_accounts",          MailAccount,          None, set()),
     ("backup_config",          BackupConfig,         None, set()),
     # NOTE: backup_runs intentionally excluded — meta about backups themselves
 ]
@@ -312,6 +313,49 @@ async def send_to_telegram(token: str, chat_id: str, content: bytes, filename: s
     if not j.get("ok"):
         raise RuntimeError(f"Telegram: {j.get('description')}")
     return {"message_id": j["result"]["message_id"]}
+
+
+async def list_sftp_backups(host: str, port: int, username: str, password: str, remote_path: str) -> list[dict]:
+    """List files matching dm-backup-*.zip in the remote path."""
+    import asyncssh
+    target_dir = remote_path.rstrip("/") or "."
+    out = []
+    async with asyncssh.connect(
+        host, port=port, username=username, password=password, known_hosts=None,
+    ) as conn:
+        async with conn.start_sftp_client() as sftp:
+            try:
+                entries = await sftp.readdir(target_dir)
+            except (asyncssh.SFTPNoSuchFile, FileNotFoundError):
+                return []
+            for e in entries:
+                name = getattr(e, "filename", None) or str(e)
+                if name in (".", ".."):
+                    continue
+                if not (name.startswith("dm-backup-") and name.endswith(".zip")):
+                    continue
+                attrs = getattr(e, "attrs", None)
+                size = getattr(attrs, "size", None) if attrs else None
+                mtime = getattr(attrs, "mtime", None) if attrs else None
+                out.append({
+                    "name": name,
+                    "size": size,
+                    "mtime": mtime,
+                })
+    out.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
+    return out
+
+
+async def download_from_sftp(host: str, port: int, username: str, password: str, remote_path: str, filename: str) -> bytes:
+    import asyncssh
+    target_dir = remote_path.rstrip("/") or "."
+    full = f"{target_dir}/{filename}"
+    async with asyncssh.connect(
+        host, port=port, username=username, password=password, known_hosts=None,
+    ) as conn:
+        async with conn.start_sftp_client() as sftp:
+            async with sftp.open(full, "rb") as f:
+                return await f.read()
 
 
 async def send_to_sftp(host: str, port: int, username: str, password: str, remote_path: str,

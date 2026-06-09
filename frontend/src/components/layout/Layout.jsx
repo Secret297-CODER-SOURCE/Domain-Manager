@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles } from 'lucide-react'
+import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox } from 'lucide-react'
 import { useAuthStore } from '../../store/auth'
 import toast from 'react-hot-toast'
 
@@ -24,6 +24,7 @@ export default function Layout() {
     { to: '/purchases', icon: ShoppingBag,     label: 'Закупки' },
     { to: '/kuma',      icon: Activity,        label: 'Uptime Kuma' },
     { to: '/identities', icon: Sparkles,       label: 'Особистості' },
+    { to: '/mail',       icon: Inbox,          label: 'Пошта' },
   ]
   const adminNav = [
     { to: '/passwords', icon: ShieldCheck, label: 'Паролі' },

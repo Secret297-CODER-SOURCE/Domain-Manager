@@ -5,11 +5,13 @@ import { saveAs } from 'file-saver'
 import {
   Save, Download, Upload, Send, Server, Lock, Clock, ShieldCheck, AlertTriangle,
   RefreshCw, Trash2, CheckCircle2, Database, Archive, History, ArrowDownToLine,
+  FileUp, FolderDown,
 } from 'lucide-react'
 
 import {
   getBackupConfig, saveBackupConfig, listBackupRuns, deleteBackupRun,
   runBackup, previewBackupRestore, doBackupRestore,
+  listSftpBackups, previewSftpBackup, restoreFromSftp,
 } from '../api/client'
 import { Btn, Modal, Spinner, Field, Badge } from '../components/ui/index'
 import { useDeleteOtp } from '../context/DeleteOtpContext'
@@ -320,48 +322,101 @@ function RunRow({ run, onDelete }) {
 
 function RestoreModal({ open, onClose }) {
   const qc = useQueryClient()
+  const [source, setSource] = useState('file') // 'file' | 'sftp'
   const [file, setFile] = useState(null)
+  const [sftpFile, setSftpFile] = useState(null) // selected SFTP filename
   const [password, setPassword] = useState('')
   const [preview, setPreview] = useState(null)
   const [mode, setMode] = useState('merge')
   const [loading, setLoading] = useState(false)
   const [restoring, setRestoring] = useState(false)
+  const [sftpList, setSftpList] = useState(null)
+  const [sftpLoading, setSftpLoading] = useState(false)
+  const [sftpError, setSftpError] = useState(null)
 
-  useEffect(() => { if (open) { setFile(null); setPassword(''); setPreview(null); setMode('merge') } }, [open])
+  useEffect(() => {
+    if (!open) return
+    setSource('file'); setFile(null); setSftpFile(null); setPassword('')
+    setPreview(null); setMode('merge'); setSftpList(null); setSftpError(null)
+  }, [open])
+
+  async function loadSftpList() {
+    setSftpLoading(true); setSftpError(null)
+    try {
+      const r = await listSftpBackups()
+      setSftpList(r.data)
+    } catch (e) {
+      setSftpError(e.response?.data?.detail || e.message || 'Помилка SFTP')
+    } finally { setSftpLoading(false) }
+  }
+
+  // Auto-load list when switching to SFTP tab
+  useEffect(() => {
+    if (open && source === 'sftp' && !sftpList && !sftpLoading) loadSftpList()
+    // eslint-disable-next-line
+  }, [open, source])
 
   async function doPreview() {
-    if (!file) return
     setLoading(true)
     try {
-      const r = await previewBackupRestore(file, password)
-      setPreview(r.data.manifest)
+      if (source === 'file') {
+        if (!file) return
+        const r = await previewBackupRestore(file, password)
+        setPreview(r.data.manifest)
+      } else {
+        if (!sftpFile) return
+        const r = await previewSftpBackup(sftpFile, password)
+        setPreview(r.data.manifest)
+      }
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Помилка читання архіву')
     } finally { setLoading(false) }
   }
 
   async function doRestore() {
-    if (!file) return
     if (mode === 'replace' && !window.confirm('УВАГА: режим "replace" видалить ВСЕ існуюче і замінить даними з архіву. Точно продовжити?')) return
     setRestoring(true)
     try {
-      const r = await doBackupRestore(file, password, mode)
+      let r
+      if (source === 'file') r = await doBackupRestore(file, password, mode)
+      else                    r = await restoreFromSftp(sftpFile, password, mode)
       const stats = r.data.stats || {}
       const total = Object.values(stats).reduce((s, x) => s + (x.inserted || 0) + (x.updated || 0), 0)
       toast.success(`Відновлено: ${total} записів`)
-      qc.invalidateQueries() // refresh everything
+      qc.invalidateQueries()
       onClose()
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Помилка відновлення')
     } finally { setRestoring(false) }
   }
 
+  const canPreview = source === 'file' ? !!file : !!sftpFile
+
   return (
-    <Modal open={open} onClose={onClose} title="Відновлення з бекапу" width={560}>
+    <Modal open={open} onClose={onClose} title="Відновлення з бекапу" width={620}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <Field label=".zip файл бекапу">
-          <input type="file" accept=".zip" onChange={e => { setFile(e.target.files?.[0] || null); setPreview(null) }} />
-        </Field>
+        {/* Source switcher */}
+        <div style={{ display: 'flex', gap: 4, background: 'var(--bg3)', borderRadius: 8, padding: 3 }}>
+          <SourceTab active={source === 'file'} onClick={() => { setSource('file'); setPreview(null) }} icon={<FileUp size={13} />}>
+            З файлу
+          </SourceTab>
+          <SourceTab active={source === 'sftp'} onClick={() => { setSource('sftp'); setPreview(null) }} icon={<Server size={13} />}>
+            З SFTP-сервера
+          </SourceTab>
+        </div>
+
+        {source === 'file' ? (
+          <Field label=".zip файл бекапу">
+            <input type="file" accept=".zip" onChange={e => { setFile(e.target.files?.[0] || null); setPreview(null) }} />
+          </Field>
+        ) : (
+          <SftpPicker
+            data={sftpList} loading={sftpLoading} error={sftpError}
+            selected={sftpFile} onSelect={(name) => { setSftpFile(name); setPreview(null) }}
+            onRefresh={loadSftpList}
+          />
+        )}
+
         <Field label="Пароль (якщо архів зашифрований)">
           <input type="password" value={password} onChange={e => setPassword(e.target.value)} />
         </Field>
@@ -369,7 +424,7 @@ function RestoreModal({ open, onClose }) {
         {!preview ? (
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
-            <Btn loading={loading} disabled={!file} onClick={doPreview}>
+            <Btn loading={loading} disabled={!canPreview} onClick={doPreview}>
               <ArrowDownToLine size={13} /> Перевірити архів
             </Btn>
           </div>
@@ -409,5 +464,88 @@ function RestoreModal({ open, onClose }) {
         )}
       </div>
     </Modal>
+  )
+}
+
+function SourceTab({ active, onClick, icon, children }) {
+  return (
+    <button onClick={onClick} style={{
+      flex: 1, padding: '8px 12px', borderRadius: 6, border: 'none',
+      background: active ? 'var(--bg2)' : 'transparent',
+      color: active ? 'var(--text)' : 'var(--text3)',
+      fontSize: 12, fontWeight: 600, cursor: 'pointer',
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+      boxShadow: active ? '0 1px 2px rgba(0,0,0,0.2)' : 'none',
+      transition: 'all 0.15s',
+    }}>
+      {icon} {children}
+    </button>
+  )
+}
+
+function SftpPicker({ data, loading, error, selected, onSelect, onRefresh }) {
+  if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 24 }}><Spinner /></div>
+  if (error) return (
+    <div style={{
+      background: 'var(--red-dim)', border: '1px solid rgba(255,69,58,0.3)', borderRadius: 8,
+      padding: 14, fontSize: 12, color: 'var(--red)', display: 'flex', flexDirection: 'column', gap: 8,
+    }}>
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <AlertTriangle size={14} /> {error}
+      </div>
+      <Btn size="sm" variant="ghost" onClick={onRefresh}><RefreshCw size={12} /> Повторити</Btn>
+    </div>
+  )
+  if (!data) return null
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--text3)' }}>
+        <FolderDown size={12} />
+        <span style={{ fontFamily: 'var(--mono)' }}>{data.path}</span>
+        <span>·</span>
+        <span>{data.files.length} файлів</span>
+        <button onClick={onRefresh} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 2 }} title="Оновити">
+          <RefreshCw size={12} />
+        </button>
+      </div>
+      {data.files.length === 0 ? (
+        <div style={{ padding: 24, textAlign: 'center', color: 'var(--text3)', fontSize: 12, background: 'var(--bg3)', borderRadius: 8 }}>
+          У вказаному каталозі немає файлів dm-backup-*.zip
+        </div>
+      ) : (
+        <div style={{ maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+          {data.files.map(f => {
+            const active = selected === f.name
+            return (
+              <div key={f.name} onClick={() => onSelect(f.name)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 12px', borderRadius: 8, cursor: 'pointer',
+                  background: active ? 'var(--accent-dim)' : 'var(--bg3)',
+                  border: '1px solid', borderColor: active ? 'rgba(10,132,255,0.4)' : 'var(--border)',
+                }}
+                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border2)' }}
+                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)' }}
+              >
+                <Archive size={13} style={{ color: active ? 'var(--accent)' : 'var(--text3)' }} />
+                <span style={{ flex: 1, fontFamily: 'var(--mono)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {f.name}
+                </span>
+                {f.size != null && (
+                  <span style={{ fontSize: 11, color: 'var(--text3)', whiteSpace: 'nowrap' }}>
+                    {(f.size / 1024).toFixed(1)} KB
+                  </span>
+                )}
+                {f.mtime != null && (
+                  <span style={{ fontSize: 11, color: 'var(--text3)', whiteSpace: 'nowrap' }}>
+                    {new Date(f.mtime * 1000).toLocaleDateString('uk-UA')}
+                  </span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
   )
 }

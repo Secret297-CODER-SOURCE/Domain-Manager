@@ -6,7 +6,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -189,6 +189,7 @@ app.include_router(backup_api.router)
 app.include_router(purchases.router)
 app.include_router(kuma.router)
 app.include_router(identities.router)
+app.include_router(mail.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

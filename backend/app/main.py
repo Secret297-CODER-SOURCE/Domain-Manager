@@ -6,7 +6,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,6 +112,11 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE identities ADD COLUMN IF NOT EXISTS password VARCHAR(256)",
             "ALTER TABLE identities ADD COLUMN IF NOT EXISTS picture VARCHAR(512)",
             "ALTER TABLE keepass_vaults ADD COLUMN IF NOT EXISTS owner_master_enc TEXT",
+            # Migrate ProtonMail Bridge accounts from container-local 127.0.0.1 to host-bridge
+            "UPDATE mail_accounts SET imap_host='host.docker.internal' WHERE imap_host='127.0.0.1' AND imap_port=1143",
+            "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS tags VARCHAR(512)",
+            "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS notes TEXT",
+            "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS linked_data TEXT",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))
@@ -190,6 +195,11 @@ app.include_router(purchases.router)
 app.include_router(kuma.router)
 app.include_router(identities.router)
 app.include_router(mail.router)
+app.include_router(services_api.router)
+app.include_router(notes.router)
+app.include_router(servers_api.router)
+app.include_router(sheet_sync.router)
+app.include_router(sheet_import.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

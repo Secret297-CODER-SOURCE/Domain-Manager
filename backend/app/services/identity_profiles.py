@@ -192,7 +192,7 @@ PROFILES: dict[str, dict] = {
         "name": "Poland",
         "cities": [("Warsaw", "Mazowieckie"), ("Kraków", "Małopolskie"), ("Łódź", "Łódzkie"),
                    ("Wrocław", "Dolnośląskie"), ("Poznań", "Wielkopolskie"), ("Gdańsk", "Pomorskie")],
-        "phone": "+48 ### ### ###",
+        "phone": "+48 5## ### ###",
         "postal": "##-###",
         "lat": "52.2297", "lon": "21.0122",
         "streets": ["ul. Marszałkowska", "ul. Floriańska", "ul. Piotrkowska", "Aleje Jerozolimskie"],
@@ -359,17 +359,54 @@ def fill_format(fmt: str | int) -> str:
     return "".join(out)
 
 
-def synth_for(code: str) -> dict:
+def _feminize_surname(code: str, last: str) -> str:
+    """Apply gender-aware suffix transformation to surnames in Slavic languages."""
+    if code in ("pl",):
+        # -ski/-cki/-dzki → -ska/-cka/-dzka
+        for m, f in (("ski", "ska"), ("cki", "cka"), ("dzki", "dzka"), ("zki", "zka")):
+            if last.endswith(m):
+                return last[: -len(m)] + f
+    if code in ("ru", "by"):
+        # Cyrillic forms
+        for m, f in (("ский", "ская"), ("цкий", "цкая"), ("нкий", "нкая"),
+                     ("ов", "ова"), ("ев", "ева"), ("ин", "ина"), ("ын", "ына")):
+            if last.endswith(m):
+                return last[: -len(m)] + f
+        # Latin transliterations
+        for m, f in (("sky", "skaya"), ("ski", "skaya"), ("tsky", "tskaya"),
+                     ("ov", "ova"), ("ev", "eva"), ("yov", "yova"),
+                     ("in", "ina"), ("yn", "yna")):
+            if last.endswith(m):
+                return last[: -len(m)] + f
+    if code == "ua":
+        for m, f in (("ський", "ська"), ("цький", "цька"), ("енко", "енко")):
+            if last.endswith(m):
+                return last[: -len(m)] + f
+        for m, f in (("ов", "ова"), ("ев", "ева"), ("ів", "іва")):
+            if last.endswith(m):
+                return last[: -len(m)] + f
+    return last
+
+
+def synth_for(code: str, gender: str | None = None) -> dict:
     """Build a synthetic identity overlay for the given country code.
+    `gender` may be 'male' / 'female' to force a specific gender — used so the
+    photo (from randomuser) matches the name we generate. If None, picked at
+    random.
     Returns a dict of fields to OVERRIDE on top of a randomuser base.
     """
     p = PROFILES.get(code)
     if not p:
         return {}
-    gender_male = random.random() < 0.5
+    if gender is None:
+        gender_male = random.random() < 0.5
+    else:
+        gender_male = gender.lower().startswith("m")
     first_pool = p["first_male"] if gender_male else p["first_female"]
     first = random.choice(first_pool)
     last = random.choice(p["last"])
+    if not gender_male:
+        last = _feminize_surname(code, last)
     city, region = random.choice(p["cities"])
     street = f"{random.choice(p['streets'])} {secrets.randbelow(300) + 1}"
 

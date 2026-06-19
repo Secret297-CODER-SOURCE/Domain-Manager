@@ -36,9 +36,30 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./backend:/app
+      - hydroxide_data:/data
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - dm_network
+    # So backend can reach ProtonMail Bridge / other IMAP servers running on the host
+    # host.docker.internal is auto-provided by Docker Desktop (macOS/Windows).
+    # On Linux, the extra_hosts entry below makes it work too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Open-source ProtonMail Bridge (https://github.com/emersion/hydroxide) — speaks
+  # Proton's E2E-encrypted API and exposes plain IMAP/SMTP on the docker network.
+  # Backend authenticates Proton accounts via shared /data volume; this container
+  # only runs `serve`.
+  hydroxide:
+    build:
+      context: ./hydroxide
+      dockerfile: Dockerfile
+    container_name: dm_hydroxide
+    restart: unless-stopped
+    volumes:
+      - hydroxide_data:/data
     networks:
       - dm_network
 
@@ -72,6 +93,7 @@ services:
 
 volumes:
   postgres_data:
+  hydroxide_data:
 
 networks:
   dm_network:

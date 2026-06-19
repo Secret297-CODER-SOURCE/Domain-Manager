@@ -8,6 +8,7 @@ import asyncio
 import random
 import re
 import secrets
+import unicodedata
 import httpx
 
 from app.db.session import get_db
@@ -130,26 +131,100 @@ def generate_ssn(cc: str, given: Optional[str] = None) -> str:
     cc = cc.lower()
     r = lambda n: "".join(str(secrets.randbelow(10)) for _ in range(n))
     if cc == "us":
-        # SSN: NNN-NN-NNNN, avoid invalid ranges loosely
+        # SSN: NNN-NN-NNNN, avoid invalid ranges loosely (no 000, 666, 9XX area)
         a = secrets.randbelow(899) + 1
         if a == 666: a = 665
         return f"{a:03d}-{secrets.randbelow(99)+1:02d}-{secrets.randbelow(9999)+1:04d}"
     if cc == "ca":
-        return f"{r(3)}-{r(3)}-{r(3)}"  # SIN format
+        return f"{r(3)}-{r(3)}-{r(3)}"   # SIN format
     if cc == "ua":
-        return r(10)  # ІПН
+        return r(10)                     # ІПН — 10 digits
     if cc in ("gb", "uk"):
-        # NI number: 2 letters + 6 digits + 1 letter
+        # NI: 2 letters + 6 digits + 1 letter A-D
         letters = "ABCEGHJKLMNOPRSTWXYZ"
         return f"{random.choice(letters)}{random.choice(letters)} {r(2)} {r(2)} {r(2)} {random.choice('ABCD')}"
     if cc == "de":
-        return r(11)
+        return r(11)                     # Steuer-ID
     if cc == "fr":
-        return r(13)
+        return f"{r(1)} {r(2)} {r(2)} {r(2)} {r(3)} {r(3)} {r(2)}"  # INSEE 15 digits grouped
     if cc in ("ru", "by"):
-        return r(11)
-    # Generic fallback
+        return f"{r(3)}-{r(3)}-{r(3)} {r(2)}"   # СНИЛС format
+    if cc == "jp":
+        # My Number — 12 digits, often shown as 4-4-4
+        return f"{r(4)} {r(4)} {r(4)}"
+    if cc in ("in",):
+        # Aadhaar — 12 digits, 4-4-4
+        return f"{r(4)} {r(4)} {r(4)}"
+    if cc == "cn":
+        # ID card — 18 chars: 6 region + YYYYMMDD + 3 seq + 1 check (X allowed)
+        from datetime import datetime
+        year = 1960 + secrets.randbelow(45)
+        month = secrets.randbelow(12) + 1
+        day = secrets.randbelow(28) + 1
+        return f"{r(6)}{year:04d}{month:02d}{day:02d}{r(3)}{random.choice('0123456789X')}"
+    if cc == "ar":
+        return r(8)                      # DNI 7-8 digits
+    if cc in ("br",):
+        return f"{r(3)}.{r(3)}.{r(3)}-{r(2)}"   # CPF
+    if cc == "mx":
+        # CURP-ish 18 chars
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return f"{random.choice(letters)}{random.choice(letters)}{random.choice(letters)}{random.choice(letters)}{r(6)}{random.choice('HM')}{random.choice(letters)*2}{r(2)}"
+    if cc == "es":
+        # DNI: 8 digits + 1 letter
+        n = r(8); letter = "TRWAGMYFPDXBNJZSQVHLCKE"[int(n) % 23]
+        return f"{n}{letter}"
+    if cc == "it":
+        # Codice Fiscale — 16 alphanumeric
+        ab = "".join(random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(6))
+        return f"{ab}{r(2)}{random.choice('ABCDEHLMPRST')}{r(2)}{random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')}{r(3)}{random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')}"
+    if cc == "pl":
+        return r(11)                     # PESEL
+    if cc == "nl":
+        return r(9)                      # BSN
+    if cc == "se":
+        return f"{r(6)}-{r(4)}"          # Personnummer YYMMDD-XXXX
+    if cc == "kr":
+        return f"{r(6)}-{r(7)}"          # RRN
+    if cc == "tr":
+        return r(11)                     # TC Kimlik
+    if cc == "ro":
+        return r(13)                     # CNP
+    if cc in ("au", "nz"):
+        return r(9)
+    # Generic fallback: 9 digits
     return r(9)
+
+
+# ── Helpers: ASCII slug + phone sanitize ─────────────────────────────────
+
+def ascii_slug(text: Optional[str], default: str = "user") -> str:
+    """Transliterate to ASCII (NFKD) → drop non-letters → lowercase. Falls back
+    to `default` if nothing left after normalization (e.g. CJK name)."""
+    if not text:
+        return default
+    norm = unicodedata.normalize("NFKD", text)
+    ascii_only = norm.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^A-Za-z]+", "", ascii_only).lower()
+    return slug[:24] or default
+
+
+def sanitize_phone(raw: Optional[str], fallback_fmt: Optional[str] = None) -> Optional[str]:
+    """randomuser.me sometimes returns letters in phone (notably for nat=ua,
+    where digits 7-9 are replaced with random uppercase letters). Replace any
+    embedded letter with a random digit so the value is dialable. If the input
+    looks unusable and a country-specific fallback format is provided, generate
+    a fresh number from the format."""
+    if not raw:
+        return None
+    # Replace any A-Z / a-z with a random digit
+    if re.search(r"[A-Za-z]", raw):
+        cleaned = "".join(
+            str(secrets.randbelow(10)) if ch.isalpha() else ch
+            for ch in raw
+        )
+        return cleaned
+    return raw
 
 
 # ── randomuser.me fetch ──────────────────────────────────────────────────
@@ -162,7 +237,10 @@ async def fetch_one(code: str) -> IdentityData:
         raise HTTPException(400, f"Unsupported locale '{code}'. Available: {LOCATIONS}")
 
     nat = NAT_ALIAS.get(code, code)
-    params = {"results": "1"}
+    # Pre-decide gender so that the photo (from randomuser) matches the name
+    # we may overlay later for non-native locales.
+    forced_gender = random.choice(("male", "female"))
+    params = {"results": "1", "gender": forced_gender}
     if nat in RANDOMUSER_NATS:
         params["nat"] = nat
 
@@ -214,7 +292,7 @@ async def fetch_one(code: str) -> IdentityData:
         gender=(u.get("gender") or "").capitalize() or None,
         birthday=birthday,
         ssn=generate_ssn(code, given_ssn),
-        phone=u.get("phone") or u.get("cell") or None,
+        phone=sanitize_phone(u.get("phone") or u.get("cell")),
         email=u.get("email") or None,
         username=login.get("username") or None,
         password=login.get("password") or None,
@@ -234,21 +312,27 @@ async def fetch_one(code: str) -> IdentityData:
     #   • we have a profile but randomuser's location/phone don't match (cleanup)
     #
     # The base from randomuser still keeps email/username/password/picture/birthday/card.
-    overlay = synth_for(code)
+    overlay = synth_for(code, gender=forced_gender)
     if overlay and nat not in RANDOMUSER_NATS:
         # Country not native — replace name + all location/phone fields with country-correct ones
         for k, v in overlay.items():
             setattr(base, k, v)
-        # Rebuild username & email so they match the new name
-        if base.full_name:
-            slug = re.sub(r"[^a-z]+", "", base.full_name.lower())[:18] or "user"
-            base.username = f"{slug}{secrets.randbelow(900) + 100}"
-            base.email = f"{slug}{secrets.randbelow(900) + 100}@example.com"
+        # Rebuild username & email so they match the new name (ASCII-safe).
+        # Use the SAME numeric suffix for both so they look like a coherent pair.
+        slug = ascii_slug(base.full_name, "user")
+        suffix = secrets.randbelow(9000) + 1000
+        base.username = f"{slug}{suffix}"
+        base.email    = f"{slug}{suffix}@example.com"
         # SSN according to country format
         base.ssn = generate_ssn(code)
     elif overlay:
-        # Native nat — at least ensure country_full reads consistently (randomuser sometimes returns aliases)
+        # Native nat — keep randomuser data, but normalize country_full to avoid aliases
         base.country_full = overlay.get("country_full") or base.country_full
+        # If username/email are missing OR contain non-ASCII garbage from randomuser, regenerate.
+        if base.username and not base.username.isascii():
+            base.username = f"{ascii_slug(base.full_name)}{secrets.randbelow(900) + 100}"
+        if base.email and not base.email.isascii():
+            base.email = f"{ascii_slug(base.full_name)}{secrets.randbelow(900) + 100}@example.com"
 
     return base
 

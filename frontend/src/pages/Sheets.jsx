@@ -5,12 +5,14 @@ import '@fortune-sheet/react/dist/index.css'
 import toast from 'react-hot-toast'
 import {
   Plus, Trash2, Download, Upload, FileSpreadsheet, Save,
-  Lock, Unlock, X, LayoutGrid, Globe, ExternalLink, RefreshCw,
+  Lock, Unlock, X, LayoutGrid, Globe, ExternalLink, RefreshCw, Link2,
+  Server, Mail as MailIcon, FileText, ChevronRight, ChevronDown, ArrowLeft, ArrowRight,
+  Check, AlertTriangle, RotateCw, XCircle, CheckCircle2, Sparkles,
 } from 'lucide-react'
 import { saveAs } from 'file-saver'
 import * as XLSX from 'xlsx'
 
-import {
+import api, {
   getSheets, createSheet, getSheet, updateSheet, deleteSheet, renameSheet,
 } from '../api/client'
 import { Btn, Spinner, Modal, Field, Badge } from '../components/ui/index'
@@ -162,7 +164,9 @@ function SheetList({ onOpen, sheets }) {
   const { gateDelete } = useDeleteOtp()
   const [newModal, setNewModal] = useState(false)
   const [gsheetModal, setGsheetModal] = useState(false)
+  const [importModal, setImportModal] = useState(false)
   const [unlockSheet, setUnlockSheet] = useState(null)
+  const [bindSheet, setBindSheet] = useState(null)
   const fileRef = useRef(null)
 
   const createMut = useMutation({
@@ -242,6 +246,9 @@ function SheetList({ onOpen, sheets }) {
           <Btn variant="ghost" onClick={() => setGsheetModal(true)}>
             <Globe size={14} /> Google Sheet
           </Btn>
+          <Btn variant="ghost" onClick={() => setImportModal(true)}>
+            <Download size={14} /> Імпорт у Domain Manager
+          </Btn>
           <Btn onClick={() => setNewModal(true)}>
             <Plus size={14} /> Нова таблиця
           </Btn>
@@ -261,6 +268,7 @@ function SheetList({ onOpen, sheets }) {
             {sheets.map(s => (
               <SheetCard key={s.id} sheet={s}
                 onOpen={() => handleCardOpen(s)}
+                onBind={() => setBindSheet(s)}
                 onDelete={() => gateDelete(() => delMut.mutateAsync(s.id)).catch(() => {})}
                 onRename={() => {
                   const name = prompt('Нова назва:', s.name)
@@ -284,11 +292,597 @@ function SheetList({ onOpen, sheets }) {
         loading={createGsheetMut.isPending} />
       <UnlockSheetModal sheet={unlockSheet} onClose={() => setUnlockSheet(null)}
         onUnlocked={(id, password) => { setUnlockSheet(null); onOpen(id, password) }} />
+      <BindingModal sheet={bindSheet} onClose={() => setBindSheet(null)} />
+      <GoogleImportModal open={importModal} onClose={() => setImportModal(false)} />
     </div>
   )
 }
 
-function SheetCard({ sheet, onOpen, onDelete, onRename }) {
+
+// ─── Google Sheets import wizard ────────────────────────────────────────
+
+function GoogleImportModal({ open, onClose }) {
+  const [step, setStep] = useState(1)
+  const [source, setSource] = useState('google') // google | local | file
+  const [url, setUrl] = useState('')
+  const [info, setInfo] = useState(null)        // { sheet_id, title, tabs }
+  const [tab, setTab] = useState(null)          // selected tab object (gid for google, index for local/file)
+  const [preview, setPreview] = useState(null)  // { headers, rows, total_rows, guess, sheets? }
+  const [target, setTarget] = useState('servers')
+  const [cmap, setCmap] = useState({})          // entity_field → header
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+  // Local & file sources
+  const [localSheetId, setLocalSheetId] = useState(null)
+  const [uploadFile, setUploadFile] = useState(null)
+  // Multi-tab queue: tabs the user selected on step 2; processed one-by-one on step 3
+  const [queue, setQueue] = useState([])         // [tabObj, ...] — remaining tabs to import
+  const [aggregated, setAggregated] = useState([]) // [{tab_name, target, result}]
+  const { data: localSheets = [] } = useQuery({
+    queryKey: ['sheets'], queryFn: () => api.get('/sheets').then(r => r.data),
+    enabled: open,
+  })
+
+  useEffect(() => {
+    if (!open) {
+      setStep(1); setSource('google'); setUrl(''); setInfo(null); setTab(null);
+      setPreview(null); setCmap({}); setResult(null); setTarget('servers');
+      setLocalSheetId(null); setUploadFile(null);
+      setQueue([]); setAggregated([]);
+    }
+  }, [open])
+
+  function guessTargetByName(name) {
+    const lc = (name || '').toLowerCase()
+    if (/vps|server|сервер/.test(lc)) return 'servers'
+    if (/mail|пошт|почт/.test(lc))    return 'mail'
+    return 'notes'
+  }
+
+  async function nextFromStep1() {
+    setBusy(true)
+    try {
+      if (source === 'google') {
+        if (!url.trim()) { setBusy(false); return }
+        const r = await api.post('/sheet-import/discover', { url: url.trim() })
+        setInfo(r.data); setStep(2)
+      } else if (source === 'local') {
+        if (!localSheetId) { setBusy(false); return }
+        // Fetch preview for sheet_index=0; the preview returns "sheets" list for tab picking
+        const r = await api.post('/sheet-import/local/preview', { sheet_id: localSheetId, sheet_index: 0 })
+        const sheets = r.data.sheets || [{ index: 0, name: r.data.sheet_name }]
+        if (sheets.length > 1) {
+          setInfo({ title: r.data.sheet_name, tabs: sheets.map(s => ({ ...s, gid: String(s.index) })) })
+          setStep(2)
+        } else {
+          setTab({ name: r.data.sheet_name, index: 0 })
+          setPreview(r.data)
+          const g = guessTargetByName(r.data.sheet_name)
+          setTarget(g); setCmap(r.data.guess?.[g] || {})
+          setStep(3)
+        }
+      } else if (source === 'file') {
+        if (!uploadFile) { setBusy(false); return }
+        const fd = new FormData(); fd.append('file', uploadFile); fd.append('sheet_index', '0')
+        const r = await api.post('/sheet-import/file/preview', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+        const sheets = r.data.sheets || [{ index: 0, name: uploadFile.name }]
+        if (sheets.length > 1) {
+          setInfo({ title: uploadFile.name, tabs: sheets.map(s => ({ ...s, gid: String(s.index) })) })
+          setStep(2)
+        } else {
+          setTab({ name: uploadFile.name, index: 0 })
+          setPreview(r.data)
+          const g = guessTargetByName(uploadFile.name)
+          setTarget(g); setCmap(r.data.guess?.[g] || {})
+          setStep(3)
+        }
+      }
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Помилка')
+    } finally { setBusy(false) }
+  }
+
+  async function pickTab(t) {
+    setTab(t); setBusy(true)
+    try {
+      let r
+      if (source === 'google') {
+        r = await api.post('/sheet-import/preview', { url, gid: t.gid, limit: 20 })
+      } else if (source === 'local') {
+        r = await api.post('/sheet-import/local/preview', { sheet_id: localSheetId, sheet_index: t.index ?? Number(t.gid) })
+      } else {
+        const fd = new FormData()
+        fd.append('file', uploadFile)
+        fd.append('sheet_index', String(t.index ?? Number(t.gid) ?? 0))
+        r = await api.post('/sheet-import/file/preview', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      }
+      setPreview(r.data)
+      // Use backend's deep-analysis suggestion (value-based row classification)
+      const g = r.data.suggested_target || guessTargetByName(t.name)
+      setTarget(g)
+      setCmap(g === 'auto' ? {} : (r.data.guess?.[g] || {}))
+      setStep(3)
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Помилка попереднього перегляду')
+    } finally { setBusy(false) }
+  }
+
+  function changeTarget(t) {
+    setTarget(t)
+    setCmap(t === 'auto' ? {} : (preview?.guess?.[t] || {}))
+  }
+
+  async function doRun() {
+    setBusy(true)
+    try {
+      let r
+      if (source === 'google') {
+        r = await api.post('/sheet-import/run', {
+          url, gid: tab.gid, target, column_map: cmap, tab_name: tab.name,
+        })
+      } else if (source === 'local') {
+        r = await api.post('/sheet-import/local/run', {
+          sheet_id: localSheetId,
+          sheet_index: tab.index ?? Number(tab.gid) ?? 0,
+          target, column_map: cmap, tab_name: tab.name,
+        })
+      } else {
+        const fd = new FormData()
+        fd.append('file', uploadFile)
+        fd.append('target', target)
+        fd.append('column_map', JSON.stringify(cmap))
+        fd.append('sheet_index', String(tab.index ?? Number(tab.gid) ?? 0))
+        if (tab.name) fd.append('tab_name', tab.name)
+        r = await api.post('/sheet-import/file/run', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      }
+      const entry = { tab_name: tab.name, target, result: r.data }
+      const newAgg = [...aggregated, entry]
+      setAggregated(newAgg)
+      toast.success(`${tab.name}: ${r.data.created} створено, ${r.data.updated || 0} оновлено`)
+      // If multi-tab queue has remaining tabs — advance to next
+      const remaining = queue.filter(t => t.gid !== tab.gid)
+      setQueue(remaining)
+      if (remaining.length > 0) {
+        await pickTab(remaining[0])  // loads preview, advances to step 3 with next tab
+      } else {
+        setResult({ aggregated: newAgg })
+        setStep(4)
+      }
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Помилка імпорту')
+    } finally { setBusy(false) }
+  }
+
+  if (!open) return null
+  return (
+    <Modal open={open} onClose={onClose} title="Імпорт у Domain Manager" width={760}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minHeight: 360 }}>
+        {/* Step indicator */}
+        <div style={{ display: 'flex', gap: 6, fontSize: 11, color: 'var(--text3)' }}>
+          {['Джерело', 'Лист', 'Колонки', 'Готово'].map((label, i) => (
+            <span key={i} style={{
+              padding: '3px 10px', borderRadius: 99,
+              background: step === i + 1 ? 'var(--accent-dim)' : 'var(--bg2)',
+              color: step === i + 1 ? 'var(--accent)' : 'var(--text3)',
+              border: '1px solid ' + (step === i + 1 ? 'var(--accent)' : 'var(--border)'),
+            }}>{i + 1}. {label}</span>
+          ))}
+        </div>
+
+        {/* Step 1: source picker */}
+        {step === 1 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[
+                { v: 'google', label: 'Google Sheets', icon: <Globe size={12} /> },
+                { v: 'local',  label: 'Локальна таблиця', icon: <FileSpreadsheet size={12} /> },
+                { v: 'file',   label: 'Файл XLSX/CSV', icon: <Upload size={12} /> },
+              ].map(o => (
+                <button key={o.v} onClick={() => setSource(o.v)}
+                  style={{
+                    flex: 1, padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                    background: source === o.v ? 'var(--accent-dim)' : 'var(--bg2)',
+                    color: source === o.v ? 'var(--accent)' : 'var(--text2)',
+                    border: '1px solid ' + (source === o.v ? 'var(--accent)' : 'var(--border)'),
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 12,
+                  }}>{o.icon} {o.label}</button>
+              ))}
+            </div>
+
+            {source === 'google' && (
+              <>
+                {localSheets.filter(s => s.kind === 'google' && s.external_url).length > 0 && (
+                  <Field label="Уже додані Google-таблиці">
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 140, overflowY: 'auto' }}>
+                      {localSheets.filter(s => s.kind === 'google' && s.external_url).map(s => (
+                        <button key={s.id} onClick={() => setUrl(s.external_url)}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 8,
+                            padding: '6px 10px', borderRadius: 6, cursor: 'pointer', textAlign: 'left',
+                            background: url === s.external_url ? 'var(--accent-dim)' : 'var(--bg2)',
+                            color: url === s.external_url ? 'var(--accent)' : 'var(--text2)',
+                            border: '1px solid ' + (url === s.external_url ? 'var(--accent)' : 'var(--border)'),
+                            fontSize: 12,
+                          }}>
+                          <Globe size={11} />
+                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.name}</span>
+                          <span style={{ fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>
+                            {s.external_url.replace(/^https?:\/\//, '')}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </Field>
+                )}
+                <Field label="Або вставте нове посилання (доступ: Anyone with link → Viewer)">
+                  <input value={url} onChange={e => setUrl(e.target.value)}
+                    placeholder="https://docs.google.com/spreadsheets/d/.../edit" autoFocus />
+                </Field>
+                <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                  Таблиця має бути розшарена «для всіх, хто має посилання».
+                </div>
+              </>
+            )}
+
+            {source === 'local' && (
+              <>
+                <Field label="Виберіть локальну таблицю">
+                  <select value={localSheetId || ''} onChange={e => setLocalSheetId(Number(e.target.value) || null)}
+                    style={{
+                      background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+                      padding: '8px 10px', color: 'var(--text)', fontSize: 13, width: '100%',
+                    }}>
+                    <option value="">— оберіть —</option>
+                    {localSheets.filter(s => s.kind !== 'google' && !s.is_encrypted).map(s => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                </Field>
+                <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                  Зашифровані сейфи в списку не доступні — їх дані шифруються в браузері. Розшифруйте таблицю, перезбережіть без пароля і повторіть.
+                </div>
+              </>
+            )}
+
+            {source === 'file' && (
+              <>
+                <Field label="Файл .xlsx або .csv">
+                  <input type="file" accept=".xlsx,.csv"
+                    onChange={e => setUploadFile(e.target.files?.[0] || null)} />
+                </Field>
+                {uploadFile && (
+                  <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                    {uploadFile.name} · {(uploadFile.size / 1024).toFixed(1)} KB
+                  </div>
+                )}
+              </>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
+              <Btn onClick={nextFromStep1} disabled={busy
+                || (source === 'google' && !url.trim())
+                || (source === 'local' && !localSheetId)
+                || (source === 'file' && !uploadFile)}>
+                {busy ? <Spinner size={12} /> : <ChevronRight size={13} />} Далі
+              </Btn>
+            </div>
+          </div>
+        )}
+
+        {/* Step 2: pick tab(s) — checkbox multi-select */}
+        {step === 2 && info && (() => {
+          const allSelected = queue.length === info.tabs.length && info.tabs.length > 0
+          const toggleAll = () => setQueue(allSelected ? [] : [...info.tabs])
+          const toggleOne = (t) => {
+            setQueue(q => q.find(x => x.gid === t.gid)
+              ? q.filter(x => x.gid !== t.gid)
+              : [...q, t])
+          }
+          async function proceed() {
+            if (!queue.length) { toast.error('Виберіть хоча б один аркуш'); return }
+            await pickTab(queue[0])  // load first tab's preview and go to step 3
+          }
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>{info.title || 'Таблиця'}</div>
+                <button onClick={toggleAll}
+                  style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 11 }}>
+                  {allSelected ? 'Зняти все' : 'Обрати все'}
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                Обрано: <b>{queue.length}</b> з {info.tabs.length} · кожен аркуш отримає свій маппінг на наступному кроці
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8, maxHeight: 320, overflowY: 'auto' }}>
+                {info.tabs.map(t => {
+                  const checked = !!queue.find(x => x.gid === t.gid)
+                  return (
+                    <label key={t.gid} style={{
+                      padding: '10px 12px', textAlign: 'left', display: 'flex', alignItems: 'flex-start', gap: 8,
+                      background: checked ? 'var(--accent-dim)' : 'var(--bg2)',
+                      border: '1px solid ' + (checked ? 'var(--accent)' : 'var(--border)'),
+                      borderRadius: 8, color: 'var(--text)', cursor: 'pointer', fontSize: 12,
+                    }}>
+                      <input type="checkbox" checked={checked} onChange={() => toggleOne(t)}
+                        style={{ width: 'auto', marginTop: 2 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.name}</div>
+                        <div style={{ fontSize: 10, color: 'var(--text3)' }}>gid: {t.gid}</div>
+                      </div>
+                    </label>
+                  )
+                })}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Btn variant="ghost" onClick={() => setStep(1)}><ArrowLeft size={13} /> Назад</Btn>
+                <Btn onClick={proceed} disabled={busy || queue.length === 0}>
+                  {busy ? <Spinner size={12} /> : <ChevronRight size={13} />} Налаштувати {queue.length || ''}
+                </Btn>
+              </div>
+            </div>
+          )
+        })()}
+
+        {/* Step 3: deep-analysis mapping */}
+        {step === 3 && preview && tab && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{tab.name}</div>
+              <div style={{ fontSize: 11, color: 'var(--text3)' }}>{preview.total_rows} рядків · {preview.headers?.length || 0} колонок</div>
+              {preview.headerless && (
+                <span style={{
+                  padding: '1px 6px', borderRadius: 99, fontSize: 10,
+                  background: 'rgba(251,191,36,0.12)', color: '#fbbf24',
+                  border: '1px solid rgba(251,191,36,0.3)',
+                }}>заголовків не виявлено — синтезовано col1, col2, …</span>
+              )}
+              {queue.length > 1 && (
+                <div style={{ fontSize: 11, color: 'var(--accent)', marginLeft: 'auto' }}>
+                  Аркуш {aggregated.length + 1} з {aggregated.length + queue.length}
+                </div>
+              )}
+            </div>
+
+            {/* Suggestion banner */}
+            {preview.suggested_target && (
+              <div style={{
+                padding: '8px 12px', background: 'rgba(125,163,255,0.06)',
+                border: '1px solid rgba(125,163,255,0.25)', borderRadius: 6,
+                fontSize: 11, color: 'var(--text2)', display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <Sparkles size={12} color="var(--accent)" />
+                <span>Аналіз пропонує: <b style={{ color: 'var(--accent)' }}>{
+                  preview.suggested_target === 'auto' ? 'Авто-розділення'
+                  : preview.suggested_target === 'servers' ? 'Сервери'
+                  : preview.suggested_target === 'mail' ? 'Пошта'
+                  : 'Нотатка'
+                }</b></span>
+                {preview.route_counts && (
+                  <span style={{ marginLeft: 6, display: 'inline-flex', gap: 10 }}>
+                    {preview.route_counts.servers > 0 && (
+                      <span style={{ color: '#7da3ff', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                        <Server size={10} /> {preview.route_counts.servers}
+                      </span>
+                    )}
+                    {preview.route_counts.mail > 0 && (
+                      <span style={{ color: '#4ade80', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                        <MailIcon size={10} /> {preview.route_counts.mail}
+                      </span>
+                    )}
+                    {preview.route_counts.skip > 0 && (
+                      <span style={{ opacity: 0.6 }}>skip {preview.route_counts.skip}</span>
+                    )}
+                  </span>
+                )}
+              </div>
+            )}
+
+            <Field label="Куди імпортувати">
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {[
+                  { v: 'auto',    label: 'Авто-розділення', icon: <Sparkles size={12} />, ok: preview.can_auto },
+                  { v: 'servers', label: 'Сервери',         icon: <Server size={12} />,   ok: preview.can_servers },
+                  { v: 'mail',    label: 'Пошта',           icon: <MailIcon size={12} />, ok: preview.can_mail },
+                  { v: 'notes',   label: 'Нотатка',         icon: <FileText size={12} />, ok: true },
+                ].map(o => {
+                  const tipMap = {
+                    auto: 'Не виявлено рядків з email чи host',
+                    servers: 'Не знайдено колонку host/ip',
+                    mail: 'Не знайдено колонку email',
+                  }
+                  return (
+                    <button key={o.v} onClick={() => changeTarget(o.v)} disabled={!o.ok}
+                      title={!o.ok ? tipMap[o.v] : ''}
+                      style={{
+                        padding: '6px 12px', borderRadius: 6,
+                        background: target === o.v ? 'var(--accent-dim)' : 'var(--bg2)',
+                        color: target === o.v ? 'var(--accent)' : o.ok ? 'var(--text2)' : 'var(--text3)',
+                        border: '1px solid ' + (target === o.v ? 'var(--accent)' : 'var(--border)'),
+                        cursor: o.ok ? 'pointer' : 'not-allowed',
+                        fontSize: 12, display: 'flex', alignItems: 'center', gap: 6,
+                        opacity: o.ok ? 1 : 0.5,
+                      }}>{o.icon} {o.label}</button>
+                  )
+                })}
+              </div>
+            </Field>
+
+            {/* Auto-mode summary */}
+            {target === 'auto' && preview.route_counts && (
+              <div style={{
+                padding: 10, background: 'var(--bg2)', border: '1px solid var(--border)',
+                borderRadius: 6, fontSize: 11, color: 'var(--text2)',
+              }}>
+                <div style={{ marginBottom: 4, color: 'var(--text3)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Авто-розділення: кожен рядок аналізується окремо
+                </div>
+                <div style={{ display: 'flex', gap: 16, fontFamily: 'var(--mono)' }}>
+                  <span style={{ color: '#7da3ff', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <Server size={11} /> <b>{preview.route_counts.servers}</b> сервер{preview.route_counts.servers === 1 ? '' : 'ів'}
+                  </span>
+                  <span style={{ color: '#4ade80', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <MailIcon size={11} /> <b>{preview.route_counts.mail}</b> поштов{preview.route_counts.mail === 1 ? 'а скринька' : 'их скриньок'}
+                  </span>
+                  {preview.route_counts.skip > 0 && (
+                    <span style={{ color: 'var(--text3)' }}>
+                      <b>{preview.route_counts.skip}</b> пропущено
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {target !== 'notes' && target !== 'auto' && (
+              <div>
+                <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 6 }}>
+                  Зв'яжіть поля сутності з колонками таблиці:
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 6, fontSize: 12 }}>
+                  {(target === 'servers'
+                    ? ['host', 'label', 'username', 'password', 'web_url', 'tags', 'notes']
+                    : ['email', 'password', 'label', 'tags', 'notes']
+                  ).map(field => {
+                    const required = (target === 'servers' && field === 'host') || (target === 'mail' && field === 'email')
+                    const filled = !!cmap[field]
+                    return (
+                      <div key={field} style={{ display: 'contents' }}>
+                        <div style={{
+                          padding: '6px 8px',
+                          background: filled ? 'var(--bg2)' : (required ? 'rgba(248,113,113,0.08)' : 'var(--bg2)'),
+                          borderRadius: 6,
+                          fontFamily: 'var(--mono)',
+                          color: required && !filled ? '#fca5a5' : 'var(--text2)',
+                          display: 'flex', alignItems: 'center',
+                        }}>
+                          {field}
+                          {required && <span style={{ color: '#f87171', marginLeft: 4 }}>*</span>}
+                        </div>
+                        <select value={cmap[field] || ''} onChange={e => setCmap(m => ({ ...m, [field]: e.target.value }))}
+                          style={{
+                            background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+                            padding: '6px 8px', color: 'var(--text)', fontSize: 12,
+                          }}>
+                          <option value="">— не імпортувати —</option>
+                          {preview.headers.map(h => {
+                            const t = preview.column_types?.[h]
+                            const tagLabel = t && t !== 'empty' ? `  [${t}]` : ''
+                            return <option key={h} value={h}>{h}{tagLabel}</option>
+                          })}
+                        </select>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Preview table with column-type badges under headers */}
+            <div style={{ marginTop: 6 }}>
+              <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>
+                Перегляд (перші {preview.rows.length} рядків):
+              </div>
+              <div style={{ maxHeight: 220, overflow: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
+                <table style={{ borderCollapse: 'collapse', fontSize: 11, fontFamily: 'var(--mono)' }}>
+                  <thead style={{ position: 'sticky', top: 0, background: 'var(--bg2)', zIndex: 1 }}>
+                    <tr>{preview.headers.map(h => (
+                      <th key={h} style={{ padding: '4px 8px', borderBottom: '1px solid var(--border)', textAlign: 'left', whiteSpace: 'nowrap', color: 'var(--text2)', verticalAlign: 'top' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                          <span>{h}</span>
+                          {preview.column_types?.[h] && preview.column_types[h] !== 'empty' && (
+                            <ColTypeBadge type={preview.column_types[h]} />
+                          )}
+                        </div>
+                      </th>
+                    ))}</tr>
+                  </thead>
+                  <tbody>{preview.rows.map((r, i) => (
+                    <tr key={i}>{preview.headers.map(h => (
+                      <td key={h} style={{ padding: '3px 8px', borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text3)' }}>
+                        {r[h] || ''}
+                      </td>
+                    ))}</tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <Btn variant="ghost" onClick={() => setStep(2)}><ArrowLeft size={13} /> Назад</Btn>
+              <Btn onClick={doRun} disabled={busy}>
+                {busy ? <Spinner size={12} /> : <Check size={13} />}
+                {queue.length > 1 ? ' Імпорт + наступний' : ' Імпортувати'}
+              </Btn>
+            </div>
+          </div>
+        )}
+
+        {/* Step 4: aggregated result */}
+        {step === 4 && result && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {result.aggregated ? (
+              <>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#4ade80' }}>
+                  <Check size={14} style={{ verticalAlign: -2 }} /> Імпортовано {result.aggregated.length} {result.aggregated.length === 1 ? 'аркуш' : 'аркушів'}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' }}>
+                  {result.aggregated.map((a, i) => (
+                    <div key={i} style={{
+                      padding: '10px 12px', background: 'var(--bg2)', border: '1px solid var(--border)',
+                      borderRadius: 8, fontSize: 12,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                        <span style={{ fontWeight: 600 }}>{a.tab_name}</span>
+                        <span style={{ fontSize: 11, color: 'var(--accent)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <ArrowRight size={11} /> {a.target}
+                        </span>
+                      </div>
+                      <div style={{ color: 'var(--text2)', display: 'flex', gap: 10, alignItems: 'center' }}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                          <Check size={11} color="#4ade80" /> <b>{a.result.created || 0}</b>
+                        </span>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                          <RotateCw size={11} color="#fbbf24" /> <b>{a.result.updated || 0}</b>
+                        </span>
+                        <span>skip <b>{a.result.skipped || 0}</b></span>
+                      </div>
+                      {a.result.errors?.length > 0 && (
+                        <div style={{ marginTop: 4, fontSize: 11, color: '#fca5a5', fontFamily: 'var(--mono)' }}>
+                          {a.result.errors.join('; ')}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{
+                padding: 14, background: 'rgba(74,222,128,0.08)', border: '1px solid rgba(74,222,128,0.3)',
+                borderRadius: 8, color: 'var(--text)',
+              }}>
+                <div style={{ fontWeight: 700, marginBottom: 6, color: '#4ade80' }}>
+                  <Check size={14} style={{ verticalAlign: -2 }} /> Готово
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text2)' }}>
+                  Створено: <b>{result.created || 0}</b> · Оновлено: <b>{result.updated || 0}</b> · Пропущено: <b>{result.skipped || 0}</b>
+                </div>
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <Btn variant="ghost" onClick={() => { setStep(2); setResult(null); setAggregated([]) }}>
+                <ArrowLeft size={13} /> Ще аркуші
+              </Btn>
+              <Btn onClick={onClose}>Закрити</Btn>
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  )
+}
+
+function SheetCard({ sheet, onOpen, onDelete, onRename, onBind }) {
   const isGoogle = sheet.kind === 'google'
   const isLocked = sheet.is_encrypted
 
@@ -315,6 +909,13 @@ function SheetCard({ sheet, onOpen, onDelete, onRename }) {
             onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
             onMouseLeave={e => e.currentTarget.style.color = 'var(--text3)'}
           ><FileSpreadsheet size={13} /></button>
+          {onBind && (
+            <button onClick={onBind} title="Прив'язати до сутності"
+              style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 4, borderRadius: 4 }}
+              onMouseEnter={e => e.currentTarget.style.color = 'var(--green)'}
+              onMouseLeave={e => e.currentTarget.style.color = 'var(--text3)'}
+            ><Link2 size={13} /></button>
+          )}
           <button onClick={onDelete} title="Видалити"
             style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 4, borderRadius: 4 }}
             onMouseEnter={e => e.currentTarget.style.color = 'var(--red)'}
@@ -595,6 +1196,7 @@ function LocalSheetEditor({ id, password, onClose }) {
 function GoogleSheetView({ meta, onClose }) {
   const qc = useQueryClient()
   const [reloadKey, setReloadKey] = useState(0)
+  const [importPanel, setImportPanel] = useState(false)
   const renameMut = useMutation({
     mutationFn: (name) => renameSheet(meta.id, name),
     onSuccess: () => qc.invalidateQueries(['sheets']),
@@ -616,6 +1218,9 @@ function GoogleSheetView({ meta, onClose }) {
           onBlurCapture={e => e.target.style.borderColor = 'transparent'}
         />
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <Btn size="sm" onClick={() => setImportPanel(true)}>
+            <Download size={13} /> Імпорт у Domain Manager
+          </Btn>
           <Btn size="sm" variant="ghost" onClick={() => setReloadKey(k => k + 1)} title="Перезавантажити">
             <RefreshCw size={13} />
           </Btn>
@@ -625,7 +1230,7 @@ function GoogleSheetView({ meta, onClose }) {
         </div>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, background: '#fff' }}>
+      <div style={{ flex: 1, minHeight: 0, background: '#fff', position: 'relative' }}>
         <iframe
           key={meta.id + ':' + reloadKey}
           src={meta.external_url}
@@ -634,6 +1239,749 @@ function GoogleSheetView({ meta, onClose }) {
           referrerPolicy="no-referrer-when-downgrade"
         />
       </div>
+
+      {importPanel && (
+        <BatchImportPanel url={meta.external_url} sheetName={meta.name}
+          onClose={() => setImportPanel(false)} />
+      )}
     </>
+  )
+}
+
+
+// ─── Batch import panel (deep analysis + checkbox per tab + per-tab mapping) ───
+
+function BatchImportPanel({ url, sheetName, onClose }) {
+  const [stage, setStage] = useState('loading') // loading | configure | running | done
+  const [data, setData] = useState(null)        // { sheet_id, title, tabs: [...] }
+  const [config, setConfig] = useState({})      // { [gid]: { include, target, column_map } }
+  const [expanded, setExpanded] = useState(null) // gid currently shown in detail
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState(null)
+  const [filter, setFilter] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    api.post('/sheet-import/batch-discover', { url, preview_limit: 5 })
+      .then(r => {
+        if (cancelled) return
+        setData(r.data)
+        const init = {}
+        for (const t of r.data.tabs) {
+          const initialTarget = t.suggested_target
+          // Pre-select tabs that confidently map to a real entity (servers or mail).
+          // Tabs that fell back to 'notes' are off by default to avoid noise.
+          init[t.gid] = {
+            include: initialTarget !== 'notes' && !t.error,
+            target: initialTarget,
+            column_map: t.guess?.[initialTarget] || {},
+          }
+        }
+        setConfig(init)
+        setStage('configure')
+      })
+      .catch(e => {
+        toast.error(e?.response?.data?.detail || 'Помилка аналізу таблиці')
+        onClose()
+      })
+    return () => { cancelled = true }
+  }, [url])
+
+  function patch(gid, p) {
+    setConfig(c => ({ ...c, [gid]: { ...c[gid], ...p } }))
+  }
+  function setTarget(gid, target) {
+    const tab = data.tabs.find(t => t.gid === gid)
+    patch(gid, { target, column_map: tab.guess?.[target] || {} })
+  }
+  function toggleAll(on) {
+    if (!data) return
+    const next = {}
+    for (const t of data.tabs) {
+      next[t.gid] = { ...config[t.gid], include: on && !t.error }
+    }
+    setConfig(next)
+  }
+  function selectByTarget(target) {
+    if (!data) return
+    const next = { ...config }
+    for (const t of data.tabs) {
+      if (t.error) continue
+      const matches = target === 'servers' ? t.can_servers
+                   : target === 'mail'    ? t.can_mail
+                   : true
+      if (matches) next[t.gid] = { ...next[t.gid], include: true, target, column_map: t.guess?.[target] || next[t.gid]?.column_map || {} }
+    }
+    setConfig(next)
+  }
+
+  const selectedCount = useMemo(
+    () => Object.values(config).filter(c => c?.include).length,
+    [config],
+  )
+  const selectedRows = useMemo(() => {
+    if (!data) return 0
+    return data.tabs.reduce((s, t) => s + (config[t.gid]?.include ? t.total_rows : 0), 0)
+  }, [data, config])
+
+  // Predicted creation counts across all selected tabs
+  const predicted = useMemo(() => {
+    if (!data) return { servers: 0, mail: 0, notes: 0 }
+    let s = 0, m = 0, n = 0
+    for (const t of data.tabs) {
+      const c = config[t.gid]
+      if (!c?.include || t.error) continue
+      if (c.target === 'servers')      s += t.total_rows
+      else if (c.target === 'mail')    m += t.total_rows
+      else if (c.target === 'notes')   n += 1
+      else if (c.target === 'auto')   { s += t.route_counts?.servers || 0; m += t.route_counts?.mail || 0 }
+    }
+    return { servers: s, mail: m, notes: n }
+  }, [data, config])
+
+  const visibleTabs = useMemo(() => {
+    if (!data) return []
+    const f = filter.trim().toLowerCase()
+    return f ? data.tabs.filter(t => t.name.toLowerCase().includes(f)) : data.tabs
+  }, [data, filter])
+
+  async function runImport() {
+    const items = data.tabs
+      .filter(t => config[t.gid]?.include && !t.error)
+      .map(t => ({
+        gid: t.gid,
+        target: config[t.gid].target,
+        column_map: config[t.gid].column_map,
+        tab_name: t.name,
+      }))
+    if (!items.length) { toast.error('Не обрано жодного аркуша'); return }
+    setRunning(true); setStage('running')
+    try {
+      const r = await api.post('/sheet-import/batch-run', { url, items })
+      setResult(r.data)
+      setStage('done')
+      const { created, updated, skipped, errors } = r.data.totals
+      toast.success(`Готово · ${created} створено · ${updated} оновлено · ${skipped} пропущено${errors ? ` · ${errors} помилок` : ''}`)
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Помилка імпорту')
+      setStage('configure')
+    } finally { setRunning(false) }
+  }
+
+  return (
+    <div style={{
+      position: 'absolute', top: 0, right: 0, bottom: 0, width: '62%', minWidth: 520,
+      background: 'var(--bg)', borderLeft: '1px solid var(--border)',
+      display: 'flex', flexDirection: 'column', boxShadow: '-12px 0 24px rgba(0,0,0,0.3)', zIndex: 5,
+    }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+        <Download size={14} color="var(--accent)" />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Імпорт у Domain Manager</div>
+          <div style={{ fontSize: 11, color: 'var(--text3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sheetName}</div>
+        </div>
+        <button onClick={onClose} style={{
+          background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 6,
+        }}><X size={16} /></button>
+      </div>
+
+      {stage === 'loading' && (
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10, color: 'var(--text3)', fontSize: 13 }}>
+          <Spinner /> <span>Аналізую вкладки…</span>
+        </div>
+      )}
+
+      {stage === 'configure' && data && (
+        <>
+          {/* Warning if only fallback gid=0 was found */}
+          {data.tabs.length === 1 && data.tabs[0].gid === '0' && (
+            <div style={{
+              margin: 12, padding: 10, background: 'rgba(255,214,10,0.08)',
+              border: '1px solid rgba(255,214,10,0.3)', borderRadius: 8, fontSize: 11, color: '#fde68a',
+              display: 'flex', alignItems: 'flex-start', gap: 8,
+            }}>
+              <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span>Не вдалось зчитати список аркушів. Переконайтесь, що таблиця розшарена «Anyone with link → Viewer». Доступний лише перший аркуш.</span>
+            </div>
+          )}
+
+          {/* Toolbar: stats + search + bulk actions */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, padding: '10px 16px',
+            background: 'var(--bg2)', borderBottom: '1px solid var(--border)', fontSize: 11,
+            flexWrap: 'wrap',
+          }}>
+            <span style={{ color: 'var(--text3)' }}>
+              <b style={{ color: 'var(--text)' }}>{data.tabs.length}</b> вкладок ·
+              обрано <b style={{ color: 'var(--accent)' }}>{selectedCount}</b> ·
+              <b style={{ color: 'var(--text)' }}> {selectedRows}</b> рядків
+            </span>
+            <div style={{ flex: 1 }} />
+            <input value={filter} onChange={e => setFilter(e.target.value)} placeholder="фільтр…"
+              style={{
+                background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+                padding: '3px 8px', fontSize: 11, color: 'var(--text)', width: 120,
+              }} />
+            <button onClick={() => selectByTarget('servers')} style={pillBtnStyle} title="Обрати вкладки придатні для серверів">
+              <Server size={10} /> Сервери
+            </button>
+            <button onClick={() => selectByTarget('mail')} style={pillBtnStyle} title="Обрати вкладки придатні для пошти">
+              <MailIcon size={10} /> Пошта
+            </button>
+            <button onClick={() => toggleAll(true)} style={pillBtnStyle}><Check size={10} /> Усе</button>
+            <button onClick={() => toggleAll(false)} style={pillBtnStyle}><X size={10} /> Зняти</button>
+          </div>
+
+          {/* Tab grid */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {visibleTabs.length === 0 && (
+              <div style={{ padding: 30, textAlign: 'center', color: 'var(--text3)', fontSize: 12 }}>
+                Нічого не знайдено за фільтром
+              </div>
+            )}
+            {visibleTabs.map(t => (
+              <CompactTabRow key={t.gid}
+                tab={t} cfg={config[t.gid]}
+                isExpanded={expanded === t.gid}
+                onToggle={() => patch(t.gid, { include: !config[t.gid]?.include })}
+                onSetTarget={(v) => setTarget(t.gid, v)}
+                onExpand={() => setExpanded(expanded === t.gid ? null : t.gid)}
+                onMapChange={(field, header) => patch(t.gid, { column_map: { ...config[t.gid].column_map, [field]: header } })}
+              />
+            ))}
+          </div>
+
+          {/* Footer — predicted creation summary + actions */}
+          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg2)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {(predicted.servers > 0 || predicted.mail > 0 || predicted.notes > 0) && (
+              <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text2)', alignItems: 'center', flexWrap: 'wrap' }}>
+                <span style={{ color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', fontSize: 10 }}>буде створено:</span>
+                {predicted.servers > 0 && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#7da3ff' }}>
+                    <Server size={12} /> <b>{predicted.servers}</b> сервер{predicted.servers === 1 ? '' : 'ів'}
+                  </span>
+                )}
+                {predicted.mail > 0 && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#4ade80' }}>
+                    <MailIcon size={12} /> <b>{predicted.mail}</b> пошт{predicted.mail === 1 ? 'а' : 'и'}
+                  </span>
+                )}
+                {predicted.notes > 0 && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--text3)' }}>
+                    <FileText size={12} /> <b>{predicted.notes}</b> нотат{predicted.notes === 1 ? 'ка' : 'ок'}
+                  </span>
+                )}
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
+              <Btn onClick={runImport} disabled={running || selectedCount === 0}>
+                {running ? <Spinner size={12} /> : <Check size={13} />} Імпортувати {selectedCount}
+              </Btn>
+            </div>
+          </div>
+        </>
+      )}
+
+      {stage === 'running' && (
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10, color: 'var(--text3)', fontSize: 13 }}>
+          <Spinner /> <span>Імпортую дані…</span>
+        </div>
+      )}
+
+      {stage === 'done' && result && (
+        <>
+          <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{
+              padding: 12, background: 'rgba(74,222,128,0.08)', border: '1px solid rgba(74,222,128,0.3)',
+              borderRadius: 8, color: 'var(--text)',
+            }}>
+              <div style={{ fontWeight: 700, color: '#4ade80', marginBottom: 6 }}>
+                <Check size={14} style={{ verticalAlign: -2 }} /> Імпорт завершено
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text2)' }}>
+                Створено: <b>{result.totals.created}</b> · Оновлено: <b>{result.totals.updated}</b> ·
+                Пропущено: <b>{result.totals.skipped}</b>{result.totals.errors ? ` · Помилок: ${result.totals.errors}` : ''}
+              </div>
+            </div>
+            {result.items.map((it, i) => (
+              <div key={i} style={{
+                padding: 10, background: 'var(--bg2)', border: '1px solid var(--border)',
+                borderRadius: 8, fontSize: 12,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>{it.tab_name}</span>
+                  <span style={{ fontSize: 11, color: it.ok ? '#4ade80' : '#f87171', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    {it.ok ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                    <ArrowRight size={10} style={{ opacity: 0.6 }} />
+                    {it.target}
+                  </span>
+                </div>
+                {it.ok ? (
+                  <div style={{ color: 'var(--text3)', fontSize: 11, display: 'flex', gap: 12 }}>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                      <Check size={10} color="#4ade80" /> {it.result?.created || 0} створено
+                    </span>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                      <RotateCw size={10} color="#fbbf24" /> {it.result?.updated || 0} оновлено
+                    </span>
+                    <span>{it.result?.skipped || 0} пропущено</span>
+                  </div>
+                ) : (
+                  <div style={{ color: '#fca5a5', fontSize: 11, fontFamily: 'var(--mono)' }}>{it.error}</div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '12px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg2)' }}>
+            <Btn onClick={onClose}>Закрити</Btn>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+const pillBtnStyle = {
+  background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 99,
+  color: 'var(--text2)', cursor: 'pointer', fontSize: 10, padding: '3px 8px',
+  display: 'inline-flex', alignItems: 'center', gap: 4,
+}
+
+// Custom-styled checkbox — visually richer than the native control.
+function NiceCheckbox({ checked, disabled, onChange, size = 16 }) {
+  return (
+    <span
+      role="checkbox"
+      aria-checked={checked}
+      aria-disabled={disabled}
+      tabIndex={disabled ? -1 : 0}
+      onClick={(e) => { if (disabled) return; e.stopPropagation(); onChange?.() }}
+      onKeyDown={(e) => { if (disabled) return; if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); onChange?.() } }}
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        width: size, height: size, borderRadius: 4, flexShrink: 0,
+        background: checked ? 'var(--accent)' : 'transparent',
+        border: '1.5px solid ' + (checked ? 'var(--accent)' : 'var(--border2, var(--border))'),
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.4 : 1,
+        transition: 'all 0.12s',
+      }}>
+      {checked && <Check size={Math.round(size * 0.72)} color="#fff" strokeWidth={3} />}
+    </span>
+  )
+}
+
+const TARGET_OPTIONS = [
+  { v: 'auto',    label: 'Авто-розділення', icon: Sparkles, needs: 'can_auto' },
+  { v: 'servers', label: 'Сервери',         icon: Server,   needs: 'can_servers' },
+  { v: 'mail',    label: 'Пошта',           icon: MailIcon, needs: 'can_mail' },
+  { v: 'notes',   label: 'Нотатка',         icon: FileText, needs: null },
+]
+
+const COL_TYPE_BADGES = {
+  email:    { label: 'email',    color: '#4ade80' },
+  ip:       { label: 'IP',       color: '#7da3ff' },
+  domain:   { label: 'domain',   color: '#7da3ff' },
+  url:      { label: 'URL',      color: '#c084fc' },
+  password: { label: 'password', color: '#fbbf24' },
+  phone:    { label: 'phone',    color: '#94a3b8' },
+  text:     { label: 'text',     color: 'var(--text3)' },
+  empty:    { label: '∅',         color: 'var(--text3)' },
+}
+
+function ColTypeBadge({ type }) {
+  const b = COL_TYPE_BADGES[type] || COL_TYPE_BADGES.text
+  return (
+    <span style={{
+      display: 'inline-block', padding: '1px 6px', borderRadius: 99,
+      fontSize: 9, fontFamily: 'var(--mono)', textTransform: 'uppercase',
+      background: 'rgba(255,255,255,0.04)', color: b.color, border: `1px solid ${b.color}33`,
+      lineHeight: 1.4, letterSpacing: '0.3px',
+    }}>{b.label}</span>
+  )
+}
+
+function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, onMapChange }) {
+  if (!cfg) return null
+  const disabled = !!tab.error
+  const TargetIcon = TARGET_OPTIONS.find(o => o.v === cfg.target)?.icon || FileText
+  const active = cfg.include && !disabled
+
+  const fields = cfg.target === 'servers'
+    ? ['host', 'label', 'username', 'password', 'web_url', 'tags', 'notes']
+    : cfg.target === 'mail'
+      ? ['email', 'password', 'label', 'tags', 'notes']
+      : []
+
+  return (
+    <div style={{
+      background: 'var(--bg2)',
+      border: '1px solid ' + (active ? 'var(--accent)' : 'var(--border)'),
+      borderRadius: 8,
+      opacity: disabled ? 0.55 : 1,
+      transition: 'border-color 0.12s',
+    }}>
+      {/* Main row — single flex line, never wraps */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px',
+        cursor: disabled ? 'default' : 'pointer',
+      }}
+        onClick={(e) => {
+          if (disabled) return
+          if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') return
+          onToggle()
+        }}>
+        <NiceCheckbox checked={!!cfg.include} disabled={disabled} onChange={onToggle} />
+
+        <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+          <div style={{
+            fontWeight: 600, fontSize: 13, color: 'var(--text)',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {tab.name}
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text3)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', alignItems: 'center', gap: 6 }}>
+            {tab.error
+              ? <span style={{ color: '#f87171' }}>помилка: {tab.error}</span>
+              : <>
+                  <span>{tab.total_rows} рядків · {tab.headers.length} колонок</span>
+                  {tab.headerless && (
+                    <span style={{
+                      padding: '0 5px', borderRadius: 99, fontSize: 9,
+                      background: 'rgba(251,191,36,0.12)', color: '#fbbf24',
+                      border: '1px solid rgba(251,191,36,0.3)', letterSpacing: '0.3px',
+                    }}>без заголовків</span>
+                  )}
+                  {tab.route_counts && (tab.route_counts.servers > 0 || tab.route_counts.mail > 0) && (
+                    <span style={{ display: 'inline-flex', gap: 6 }}>
+                      {tab.route_counts.servers > 0 && (
+                        <span style={{ color: '#7da3ff', display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                          <Server size={9} /> {tab.route_counts.servers}
+                        </span>
+                      )}
+                      {tab.route_counts.mail > 0 && (
+                        <span style={{ color: '#4ade80', display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                          <MailIcon size={9} /> {tab.route_counts.mail}
+                        </span>
+                      )}
+                      {tab.route_counts.skip > 0 && (
+                        <span style={{ opacity: 0.6 }}>skip {tab.route_counts.skip}</span>
+                      )}
+                    </span>
+                  )}
+                </>}
+          </div>
+        </div>
+
+        {!disabled && active && (
+          <div style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            padding: '3px 6px', borderRadius: 4,
+            background: cfg.target === 'servers' ? 'rgba(125,163,255,0.15)'
+              : cfg.target === 'mail' ? 'rgba(74,222,128,0.15)'
+              : 'var(--bg)',
+            color: cfg.target === 'servers' ? '#7da3ff'
+              : cfg.target === 'mail' ? '#4ade80'
+              : 'var(--text3)',
+            fontSize: 10, fontWeight: 600, flexShrink: 0,
+          }}>
+            <TargetIcon size={10} />
+            {TARGET_OPTIONS.find(o => o.v === cfg.target)?.label}
+          </div>
+        )}
+
+        {!disabled && (
+          <button onClick={(e) => { e.stopPropagation(); onExpand() }}
+            style={{
+              background: 'none', border: '1px solid var(--border)', borderRadius: 6,
+              color: isExpanded ? 'var(--accent)' : 'var(--text3)',
+              cursor: 'pointer', padding: '4px 6px', flexShrink: 0,
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+            {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          </button>
+        )}
+      </div>
+
+      {/* Expanded details */}
+      {isExpanded && !disabled && (
+        <div style={{ borderTop: '1px solid var(--border)', padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {/* Target switcher */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4 }}>Куди імпортувати</div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {TARGET_OPTIONS.map(o => {
+                const ok = !o.needs || tab[o.needs]
+                const sel = cfg.target === o.v
+                const Ic = o.icon
+                const tipMap = {
+                  auto:    'Не виявлено рядків з email чи host',
+                  servers: 'Не знайдено колонку host/ip',
+                  mail:    'Не знайдено колонку email',
+                }
+                return (
+                  <button key={o.v} disabled={!ok} onClick={() => onSetTarget(o.v)}
+                    title={!ok ? tipMap[o.v] : ''}
+                    style={{
+                      flex: 1, padding: '6px 8px', borderRadius: 6,
+                      background: sel ? 'var(--accent-dim)' : 'var(--bg)',
+                      color: sel ? 'var(--accent)' : ok ? 'var(--text2)' : 'var(--text3)',
+                      border: '1px solid ' + (sel ? 'var(--accent)' : 'var(--border)'),
+                      cursor: ok ? 'pointer' : 'not-allowed',
+                      fontSize: 11, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                      opacity: ok ? 1 : 0.5,
+                    }}>
+                    <Ic size={11} /> {o.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Auto mode — summary of what will be split */}
+          {cfg.target === 'auto' && tab.route_counts && (
+            <div style={{
+              padding: 10, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+              fontSize: 11, display: 'flex', flexDirection: 'column', gap: 4,
+            }}>
+              <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                Авто-розділення: що буде створено
+              </div>
+              <div style={{ display: 'flex', gap: 14, fontFamily: 'var(--mono)' }}>
+                <span style={{ color: '#7da3ff', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <Server size={11} /> <b>{tab.route_counts.servers}</b> сервер{tab.route_counts.servers === 1 ? '' : 'ів'}
+                </span>
+                <span style={{ color: '#4ade80', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <MailIcon size={11} /> <b>{tab.route_counts.mail}</b> поштов{tab.route_counts.mail === 1 ? 'а скринька' : 'их скриньок'}
+                </span>
+                {tab.route_counts.skip > 0 && (
+                  <span style={{ color: 'var(--text3)' }}>
+                    <b>{tab.route_counts.skip}</b> пропущено
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text3)', marginTop: 2 }}>
+                Кожен рядок аналізується окремо; маппінг колонок підбирається автоматично.
+              </div>
+            </div>
+          )}
+
+          {/* Column mapping */}
+          {cfg.target !== 'auto' && fields.length > 0 && (
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4 }}>Маппінг колонок</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '110px 1fr', gap: 4, fontSize: 11 }}>
+                {fields.map(field => {
+                  const required = (cfg.target === 'servers' && field === 'host') || (cfg.target === 'mail' && field === 'email')
+                  const filled = !!cfg.column_map[field]
+                  return (
+                    <div key={field} style={{ display: 'contents' }}>
+                      <div style={{
+                        padding: '3px 8px',
+                        background: filled ? 'var(--bg)' : 'rgba(248,113,113,0.06)',
+                        borderRadius: 4, fontFamily: 'var(--mono)', fontSize: 10,
+                        color: required && !filled ? '#fca5a5' : 'var(--text2)',
+                        display: 'flex', alignItems: 'center',
+                      }}>
+                        {field}{required && <span style={{ color: '#f87171', marginLeft: 4 }}>*</span>}
+                      </div>
+                      <select value={cfg.column_map[field] || ''} onChange={e => onMapChange(field, e.target.value)}
+                        style={{
+                          background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 4,
+                          padding: '3px 8px', color: 'var(--text)', fontSize: 11,
+                        }}>
+                        <option value="">— не імпортувати —</option>
+                        {tab.headers.map(h => <option key={h} value={h}>{h}</option>)}
+                      </select>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Preview */}
+          {tab.rows_sample.length > 0 && (
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4 }}>
+                Перші {tab.rows_sample.length} рядків
+              </div>
+              <div style={{ maxHeight: 160, overflow: 'auto', border: '1px solid var(--border)', borderRadius: 4 }}>
+                <table style={{ borderCollapse: 'collapse', fontSize: 10, fontFamily: 'var(--mono)' }}>
+                  <thead style={{ position: 'sticky', top: 0, background: 'var(--bg)', zIndex: 1 }}>
+                    <tr>{tab.headers.map(h => (
+                      <th key={h} style={{ padding: '3px 6px', borderBottom: '1px solid var(--border)', textAlign: 'left', whiteSpace: 'nowrap', color: 'var(--text3)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          <span>{h}</span>
+                          {tab.column_types?.[h] && tab.column_types[h] !== 'empty' && (
+                            <ColTypeBadge type={tab.column_types[h]} />
+                          )}
+                        </div>
+                      </th>
+                    ))}</tr>
+                  </thead>
+                  <tbody>{tab.rows_sample.map((r, i) => (
+                    <tr key={i}>{tab.headers.map(h => (
+                      <td key={h} style={{ padding: '2px 6px', borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text3)' }}>
+                        {r[h] || ''}
+                      </td>
+                    ))}</tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── Two-way binding modal ──────────────────────────────────────────────
+
+function BindingModal({ sheet, onClose }) {
+  const qc = useQueryClient()
+  const [entities, setEntities] = useState([])
+  const [entity, setEntity] = useState('')
+  const [direction, setDirection] = useState('both')
+  const [colMap, setColMap] = useState([])   // [{ header, field }]
+  const [existing, setExisting] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!sheet) return
+    setLoading(true)
+    Promise.all([
+      api.get('/sheet-sync/entities').then(r => r.data).catch(() => []),
+      api.get(`/sheet-sync/${sheet.id}`).then(r => r.data).catch(() => null),
+    ]).then(([ents, b]) => {
+      setEntities(ents || [])
+      if (b) {
+        setExisting(b)
+        setEntity(b.entity)
+        setDirection(b.direction)
+        setColMap(Object.entries(b.column_map).map(([header, field]) => ({ header, field })))
+      } else {
+        setExisting(null); setEntity(ents[0]?.key || '')
+        setColMap([])
+      }
+      setLoading(false)
+    })
+  }, [sheet?.id])
+
+  const fields = entities.find(e => e.key === entity)?.fields || []
+
+  function addRow() { setColMap(m => [...m, { header: '', field: fields[0] || '' }]) }
+  function removeRow(i) { setColMap(m => m.filter((_, idx) => idx !== i)) }
+  function defaultMap() {
+    setColMap(fields.map(f => ({ header: f, field: f })))
+  }
+
+  async function save() {
+    const map = {}
+    for (const r of colMap) if (r.header && r.field) map[r.header] = r.field
+    if (!Object.keys(map).length) { toast.error('Додайте хоча б одну колонку'); return }
+    try {
+      await api.post(`/sheet-sync/${sheet.id}`, {
+        entity, direction, column_map: map,
+      })
+      toast.success('Прив\'язано')
+      qc.invalidateQueries(['sheets'])
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Помилка')
+    }
+  }
+  async function pull() {
+    try {
+      const r = await api.post(`/sheet-sync/${sheet.id}/pull`)
+      toast.success(`Завантажено ${r.data.rows} рядків з платформи`)
+      qc.invalidateQueries(['sheets'])
+      qc.invalidateQueries(['sheet', sheet.id])
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Помилка') }
+  }
+  async function push() {
+    try {
+      const r = await api.post(`/sheet-sync/${sheet.id}/push`)
+      toast.success(`Створено: ${r.data.created}, оновлено: ${r.data.updated}, пропущено: ${r.data.skipped}`)
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Помилка') }
+  }
+  async function unbind() {
+    if (!confirm('Видалити прив\'язку?')) return
+    await api.delete(`/sheet-sync/${sheet.id}`)
+    toast.success('Прив\'язка знята')
+    setExisting(null); setColMap([])
+  }
+
+  if (!sheet) return null
+  return (
+    <Modal open={!!sheet} onClose={onClose} title={`Прив'язка таблиці «${sheet.name}»`}>
+      {loading ? <Spinner /> : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 12, color: 'var(--text3)' }}>
+            Прив'язана таблиця стає живим дзеркалом сутності платформи. Зміни на сторінці (Пошта/Сервери/Проксі/Особистості) — миттєво потрапляють у цей аркуш. Зміни в таблиці — застосовуються до сутності кнопкою «Записати в платформу».
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <Field label="Сутність">
+              <select value={entity} onChange={e => { setEntity(e.target.value); setColMap([]) }}>
+                {entities.map(e => <option key={e.key} value={e.key}>{e.key}</option>)}
+              </select>
+            </Field>
+            <Field label="Напрямок">
+              <select value={direction} onChange={e => setDirection(e.target.value)}>
+                <option value="both">↔ обидва</option>
+                <option value="pull">← з платформи в таблицю</option>
+                <option value="push">→ з таблиці в платформу</option>
+              </select>
+            </Field>
+          </div>
+
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>Карта колонок</div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <Btn variant="ghost" onClick={defaultMap}>Авто</Btn>
+                <Btn variant="ghost" onClick={addRow}><Plus size={12} /> Додати</Btn>
+              </div>
+            </div>
+            {colMap.length === 0 && (
+              <div style={{ fontSize: 12, color: 'var(--text3)', padding: 10, border: '1px dashed var(--border)', borderRadius: 6 }}>
+                Натисніть «Авто» — заповнить всі поля сутності або «Додати» вручну.
+              </div>
+            )}
+            {colMap.map((row, i) => (
+              <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                <input value={row.header} onChange={e => setColMap(m => m.map((r, idx) => idx === i ? { ...r, header: e.target.value } : r))}
+                  placeholder="Заголовок у таблиці" style={{ flex: 1 }} />
+                <select value={row.field} onChange={e => setColMap(m => m.map((r, idx) => idx === i ? { ...r, field: e.target.value } : r))}
+                  style={{ flex: 1 }}>
+                  <option value="">— поле сутності —</option>
+                  {fields.map(f => <option key={f} value={f}>{f}</option>)}
+                </select>
+                <button onClick={() => removeRow(i)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer' }}>
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {existing && (
+            <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+              Прив'язка вже існує: {existing.entity} · {existing.direction} · оновлено {existing.last_sync_at ? new Date(existing.last_sync_at).toLocaleString('uk-UA') : '—'}
+              {existing.last_error && <div style={{ color: 'var(--red)' }}>Помилка: {existing.last_error}</div>}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+            {existing && <Btn variant="danger" onClick={unbind}>Зняти прив'язку</Btn>}
+            <Btn variant="ghost" onClick={pull} disabled={!existing}>← Підтягнути з платформи</Btn>
+            <Btn variant="ghost" onClick={push} disabled={!existing}>→ Записати в платформу</Btn>
+            <Btn variant="primary" onClick={save}>Зберегти</Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
   )
 }

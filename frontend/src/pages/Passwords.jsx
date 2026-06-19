@@ -239,15 +239,44 @@ function UploadVaultModal({ open, onClose, onDone }) {
 
 function CreateVaultModal({ open, onClose, onDone }) {
   const [name, setName] = useState('')
+  const [mode, setMode] = useState('auto') // auto | manual
   const [pwd, setPwd] = useState('')
   const [pwd2, setPwd2] = useState('')
   const [remember, setRemember] = useState(true)
+  const [showPwd, setShowPwd] = useState(false)
+  const [acknowledged, setAcknowledged] = useState(false)
   const [loading, setLoading] = useState(false)
-  useEffect(() => { if (open) { setName(''); setPwd(''); setPwd2(''); setRemember(true) } }, [open])
+
+  useEffect(() => {
+    if (open) {
+      setName(''); setMode('auto'); setPwd(generatePassword(32)); setPwd2('')
+      setRemember(true); setShowPwd(false); setAcknowledged(false)
+    }
+  }, [open])
+
+  // Regenerate auto password when switching back to auto mode
+  function switchMode(m) {
+    setMode(m)
+    if (m === 'auto') { setPwd(generatePassword(32)); setPwd2(''); setShowPwd(false) }
+    else { setPwd(''); setPwd2('') }
+  }
+
+  function copyPwd() {
+    navigator.clipboard.writeText(pwd).then(
+      () => toast.success('Скопійовано в буфер'),
+      () => toast.error('Не вдалось скопіювати'),
+    )
+  }
 
   async function submit() {
-    if (pwd !== pwd2) return toast.error('Паролі не співпадають')
-    if (pwd.length < 8) return toast.error('Мастер-пароль мінімум 8 символів')
+    if (mode === 'manual') {
+      if (pwd !== pwd2) return toast.error('Паролі не співпадають')
+      if (pwd.length < 8) return toast.error('Мастер-пароль мінімум 8 символів')
+    } else {
+      if (!remember && !acknowledged) {
+        return toast.error('Збережіть пароль (скопіюйте) і підтвердіть галочкою')
+      }
+    }
     setLoading(true)
     try {
       const db = await createBlankKdbx(name, pwd)
@@ -261,34 +290,94 @@ function CreateVaultModal({ open, onClose, onDone }) {
     } finally { setLoading(false) }
   }
 
+  const canSubmit = name.trim() && pwd &&
+    (mode === 'manual' ? pwd === pwd2 : (remember || acknowledged))
+
   return (
     <Modal open={open} onClose={onClose} title="Новий сейф">
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <Field label="Назва">
           <input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Особисті" />
         </Field>
-        <Field label="Мастер-пароль">
-          <input type="password" value={pwd} onChange={e => setPwd(e.target.value)} />
-        </Field>
-        <Field label="Повторіть мастер-пароль">
-          <input type="password" value={pwd2} onChange={e => setPwd2(e.target.value)} />
-        </Field>
+
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button onClick={() => switchMode('auto')}
+            style={modeBtnStyle(mode === 'auto')}>
+            <KeyRound size={12} /> Згенерувати
+          </button>
+          <button onClick={() => switchMode('manual')}
+            style={modeBtnStyle(mode === 'manual')}>
+            <Edit3 size={12} /> Свій пароль
+          </button>
+        </div>
+
+        {mode === 'auto' ? (
+          <>
+            <Field label="Згенерований мастер-пароль (32 символи)">
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input type={showPwd ? 'text' : 'password'} value={pwd} readOnly
+                  style={{ flex: 1, fontFamily: 'var(--mono)' }} />
+                <Btn size="sm" variant="ghost" onClick={() => setShowPwd(s => !s)} title={showPwd ? 'Приховати' : 'Показати'}>
+                  {showPwd ? <EyeOff size={13} /> : <Eye size={13} />}
+                </Btn>
+                <Btn size="sm" variant="ghost" onClick={() => setPwd(generatePassword(32))} title="Згенерувати інший">
+                  <RefreshCw size={13} />
+                </Btn>
+                <Btn size="sm" variant="ghost" onClick={copyPwd} title="Копіювати">
+                  <Copy size={13} />
+                </Btn>
+              </div>
+            </Field>
+          </>
+        ) : (
+          <>
+            <Field label="Мастер-пароль">
+              <input type="password" value={pwd} onChange={e => setPwd(e.target.value)} />
+            </Field>
+            <Field label="Повторіть мастер-пароль">
+              <input type="password" value={pwd2} onChange={e => setPwd2(e.target.value)} />
+            </Field>
+          </>
+        )}
+
         <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, cursor: 'pointer' }}>
           <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} style={{ width: 'auto' }} />
-          Запамʼятати мастер-пароль (без запиту з будь-якого пристрою)
+          Запамʼятати мастер-пароль на сервері (авто-відкриття)
         </label>
+
+        {mode === 'auto' && !remember && (
+          <label style={{
+            display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12, cursor: 'pointer',
+            padding: 10, background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.25)',
+            borderRadius: 6, color: '#fca5a5',
+          }}>
+            <input type="checkbox" checked={acknowledged} onChange={e => setAcknowledged(e.target.checked)} style={{ width: 'auto', marginTop: 2 }} />
+            <span>Я скопіював пароль і зберіг його в надійному місці. Без нього сейф буде втрачено назавжди.</span>
+          </label>
+        )}
+
         <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
           {remember
-            ? 'Пароль збережеться на сервері в шифрованому вигляді (Fernet від SECRET_KEY). Якщо поділитесь сейфом з кимось — їм все одно потрібен пароль.'
-            : 'Мастер-пароль не відновлюється. Запамʼятайте або збережіть у надійному місці.'}
+            ? 'Пароль збережеться на сервері в шифрованому вигляді (Fernet від SECRET_KEY). Сейф автоматично відкриватиметься з будь-якого пристрою.'
+            : 'Мастер-пароль не зберігається. Якщо забудете — сейф не відновити.'}
         </p>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
-          <Btn loading={loading} disabled={!name.trim() || !pwd} onClick={submit}><Plus size={14} /> Створити</Btn>
+          <Btn loading={loading} disabled={!canSubmit} onClick={submit}><Plus size={14} /> Створити</Btn>
         </div>
       </div>
     </Modal>
   )
+}
+
+function modeBtnStyle(active) {
+  return {
+    flex: 1, padding: '8px 12px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+    background: active ? 'var(--accent-dim)' : 'var(--bg2)',
+    color: active ? 'var(--accent)' : 'var(--text2)',
+    border: '1px solid ' + (active ? 'var(--accent)' : 'var(--border)'),
+  }
 }
 
 function OpenVaultModal({ vault, onClose, onOpened }) {

@@ -42,8 +42,17 @@ def _parse_date(raw) -> Optional[str]:
 
 
 def _connect(host: str, port: int, ssl: bool, username: str, password: str) -> imaplib.IMAP4:
-    cls = imaplib.IMAP4_SSL if ssl else imaplib.IMAP4
-    conn = cls(host, port, timeout=20)
+    if ssl:
+        conn = imaplib.IMAP4_SSL(host, port, timeout=20)
+    else:
+        conn = imaplib.IMAP4(host, port, timeout=20)
+        # Opportunistic STARTTLS — required by ProtonMail Bridge and many self-hosted servers
+        try:
+            caps = conn.capabilities if hasattr(conn, "capabilities") else ()
+            if b"STARTTLS" in caps or "STARTTLS" in caps:
+                conn.starttls()
+        except Exception:
+            pass
     conn.login(username, password)
     return conn
 

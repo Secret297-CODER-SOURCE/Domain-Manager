@@ -194,6 +194,42 @@ class KeepassShare(Base):
     __table_args__ = (UniqueConstraint("vault_id", "user_id"),)
 
 
+class Note(Base):
+    """Personal scratch note — title + body, per user."""
+    __tablename__ = "notes"
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(256), nullable=True)
+    body = Column(Text, nullable=False, default="")
+    color = Column(String(16), nullable=True)
+    pinned = Column(Boolean, nullable=False, default=False)
+    tags = Column(String(256), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class EmbeddedService(Base):
+    """User-defined external web service rendered inline through our iframe proxy.
+    Examples: Cloudflare dashboard, ProtonMail web, registrar (Namecheap), etc.
+    Optionally routed through a Proxy entry."""
+    __tablename__ = "embedded_services"
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(128), nullable=False)
+    url = Column(String(1024), nullable=False)  # full https URL
+    kind = Column(String(32), nullable=False, default="generic")  # generic | cloudflare | proton | registrar | ...
+    color = Column(String(16), nullable=True)
+    icon = Column(String(32), nullable=True)  # lucide icon name
+    notes = Column(Text, nullable=True)
+    proxy_id = Column(Integer, ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    # Embed strategy:
+    #  - inline: try iframe with our proxy rewriting (default)
+    #  - popup: open in popup window only (for things like Proton that need real origin)
+    embed_mode = Column(String(16), nullable=False, default="inline")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Proxy(Base):
     __tablename__ = "proxies"
     id = Column(Integer, primary_key=True)
@@ -257,6 +293,12 @@ class MailAccount(Base):
     last_total = Column(Integer, nullable=True)
     last_error = Column(String(512), nullable=True)
     color = Column(String(16), nullable=True)
+    # Free-form tags (comma-separated) and notes for organizing accounts
+    tags = Column(String(512), nullable=True)
+    notes = Column(Text, nullable=True)
+    # Linked data — JSON-encoded list of {label, value, kind} entries the user
+    # attaches to this account (e.g., recovery email, phone, security code).
+    linked_data = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -353,3 +395,49 @@ class TelegramAdmin(Base):
     username = Column(String(64), unique=True, nullable=True)  # @username without @
     display_name = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Remote servers ──────────────────────────────────────────────────────
+class RemoteServer(Base):
+    """SSH-reachable server. Optionally tunneled through a Proxy entry.
+    web_url (if set) is the server's HTTP panel that the platform will
+    iframe-proxy so the user can open it inside the panel."""
+    __tablename__ = "remote_servers"
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(128), nullable=False)
+    host = Column(String(256), nullable=False)
+    port = Column(Integer, nullable=False, default=22)
+    username = Column(String(128), nullable=False, default="root")
+    auth_kind = Column(String(16), nullable=False, default="password")  # password | key
+    password_enc = Column(Text, nullable=True)         # Fernet
+    private_key_enc = Column(Text, nullable=True)      # Fernet
+    proxy_id = Column(Integer, ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True)
+    web_url = Column(String(512), nullable=True)
+    tags = Column(String(512), nullable=True)
+    notes = Column(Text, nullable=True)
+    # Optional spreadsheet binding for two-way sync
+    linked_sheet_id = Column(Integer, ForeignKey("spreadsheets.id", ondelete="SET NULL"), nullable=True)
+    last_status = Column(String(32), nullable=True)    # ok | error
+    last_status_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+# ── Generic "entity ↔ spreadsheet" two-way binding ──────────────────────
+class SheetBinding(Base):
+    """Marks a spreadsheet as a live mirror of an entity table.
+    entity = 'domains' | 'mail' | 'servers' | 'proxies' | 'identities' | 'purchases'.
+    column_map = JSON: { "Домен": "name", "Статус": "status", ... }
+    direction = 'pull' (entity → sheet), 'push' (sheet → entity), 'both'."""
+    __tablename__ = "sheet_bindings"
+    id = Column(Integer, primary_key=True)
+    sheet_id = Column(Integer, ForeignKey("spreadsheets.id", ondelete="CASCADE"), nullable=False, index=True, unique=True)
+    entity = Column(String(32), nullable=False)
+    direction = Column(String(8), nullable=False, default="both")
+    column_map = Column(Text, nullable=False, default="{}")
+    last_sync_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())

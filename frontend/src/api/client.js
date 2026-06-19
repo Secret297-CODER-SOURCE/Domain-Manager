@@ -196,15 +196,46 @@ export const deletePurchase = (id) => api.delete(`/purchases/${id}`)
 
 // Mail (IMAP)
 export const getMailPresets = () => api.get('/mail/presets')
+export const detectMailDomain = (email) => api.post('/mail/detect', { email })
 export const getMailAccounts = () => api.get('/mail')
 export const testMailAccount = (data) => api.post('/mail/test', data)
 export const createMailAccount = (data) => api.post('/mail', data)
 export const updateMailAccount = (id, data) => api.patch(`/mail/${id}`, data)
 export const deleteMailAccount = (id) => api.delete(`/mail/${id}`)
+export const bulkDeleteMailAccounts = (ids) => api.post('/mail/bulk-delete', { ids, all: !ids })
 export const refreshMailAccount = (id) => api.post(`/mail/${id}/check`)
 export const refreshAllMail = () => api.post('/mail/check-all')
 export const listMailMessages = (id, limit = 50) => api.get(`/mail/${id}/messages`, { params: { limit } })
 export const getMailMessage = (id, uid) => api.get(`/mail/${id}/messages/${uid}`)
+export const revealMailCredentials = (id) => api.get(`/mail/${id}/credentials`)
+export const grantMailWebProxy = (id) => api.post(`/mail/${id}/web-proxy-grant`)
+export const protonConnect = (email, password, totp, proxyId) =>
+  api.post('/mail/proton-connect', {
+    email, password, totp: totp || null, proxy_id: proxyId || null,
+  })
+export const protonBulkConnect = (proxyId, onlyUnconnected = true) =>
+  api.post('/mail/proton-bulk-connect', {
+    proxy_id: proxyId || null, only_unconnected: onlyUnconnected,
+  })
+
+// Embedded services (Cloudflare / Proton / registrars / etc through proxy)
+export const getServicePresets = () => api.get('/services/presets')
+export const getServices = () => api.get('/services')
+export const createService = (data) => api.post('/services', data)
+export const updateService = (id, data) => api.patch(`/services/${id}`, data)
+export const deleteService = (id) => api.delete(`/services/${id}`)
+export const probeService = (id) => api.get(`/services/${id}/probe`)
+export const grantServiceProxy = (id) => api.post(`/services/${id}/proxy-grant`)
+
+// Personal notes
+export const getNotes = (q) => api.get('/notes', { params: q ? { q } : {} })
+export const createNote = (data) => api.post('/notes', data)
+export const updateNote = (id, data) => api.patch(`/notes/${id}`, data)
+export const deleteNote = (id) => api.delete(`/notes/${id}`)
+export const importMailAccounts = (text, validate_each = false) =>
+  api.post('/mail/import', { text, validate_each })
+export const exportMailAccounts = () =>
+  api.get('/mail/export', { responseType: 'blob' })
 
 // Identities (fake-identity generator)
 export const getIdentityLocations = () => api.get('/identities/locations')
@@ -221,5 +252,7 @@ export const getKumaInstances = () => api.get('/kuma')
 export const createKumaInstance = (data) => api.post('/kuma', data)
 export const updateKumaInstance = (id, data) => api.patch(`/kuma/${id}`, data)
 export const deleteKumaInstance = (id) => api.delete(`/kuma/${id}`)
+export const probeKumaInstance = (id) => api.get(`/kuma/${id}/probe`)
+export const grantKumaProxy = (id) => api.post(`/kuma/${id}/proxy-grant`)
 
 export default api

@@ -3,11 +3,33 @@
 import * as kdbxweb from 'kdbxweb'
 
 let _argonReady = false
+let _argonLoading = null
+
+// argon2-browser is published as a UMD bundle that expects to assign to
+// `this.argon2` / `window.argon2`. When Vite imports it as an ES module the
+// outer `this` is `undefined` (strict mode), so the UMD wrapper throws
+// "Cannot set properties of undefined (setting 'argon2')".
+// Inject as a classic <script> tag instead — that runs in non-strict global
+// context and lets the UMD wrapper resolve `window` correctly.
+import argonScriptUrl from 'argon2-browser/dist/argon2-bundled.min.js?url'
+
+function loadScriptOnce(url) {
+  if (_argonLoading) return _argonLoading
+  _argonLoading = new Promise((resolve, reject) => {
+    if (window.argon2) return resolve()
+    const s = document.createElement('script')
+    s.src = url
+    s.async = true
+    s.onload = () => window.argon2 ? resolve() : reject(new Error('argon2 script loaded but window.argon2 is missing'))
+    s.onerror = () => reject(new Error('Failed to load argon2-browser'))
+    document.head.appendChild(s)
+  })
+  return _argonLoading
+}
 
 async function ensureArgon2() {
   if (_argonReady) return
-  // argon2-browser's bundled build attaches `window.argon2` (inlines WASM as base64).
-  await import('argon2-browser/dist/argon2-bundled.min.js')
+  await loadScriptOnce(argonScriptUrl)
   const argon2 = window.argon2
   if (!argon2) throw new Error('argon2-browser failed to load')
   kdbxweb.CryptoEngine.setArgon2Impl(async (password, salt, memory, iterations, length, parallelism, type, version) => {

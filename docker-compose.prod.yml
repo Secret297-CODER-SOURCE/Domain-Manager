@@ -13,7 +13,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-domainmanager}
       POSTGRES_USER: ${POSTGRES_USER:-dmuser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-YSqHLCL7aFNDuugRQEl9DJVG0fgpQt}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -28,11 +28,11 @@ services:
       dockerfile: Dockerfile.prod
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-dmuser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-domainmanager}
-      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-dmuser}:${POSTGRES_PASSWORD:-YSqHLCL7aFNDuugRQEl9DJVG0fgpQt}@db:5432/${POSTGRES_DB:-domainmanager}
+      SECRET_KEY: ${SECRET_KEY:-8e52870ec959d6189d7564219781eb63d9e51fe5a94af3872bd5530a14af9502}
       ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-8650037279:AAF-vaBa8I4xnvHRPgH2TAlYpWHE5mbpTcg}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - hydroxide_data:/data

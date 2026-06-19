@@ -51,15 +51,15 @@ services:
       - hydroxide_data:/data
 
   # The publicly-routable service. Coolify Traefik routes domain → :80 inside.
-  # Port 8080 also published on host so you can reach the app via
-  # http://<server-ip>:8080 without configuring a domain.
+  # Port 9090 also published on host so you can reach the app via
+  # http://<server-ip>:9090 without configuring a domain.
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile.prod
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "9090:80"
     depends_on:
       - backend
 

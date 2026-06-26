@@ -10,7 +10,7 @@ import {
   getAllCFAccounts, createCFAccount, updateCFAccount, deleteCFAccount,
   getDynadotAccounts, createDynadotAccount, updateDynadotAccount, deleteDynadotAccount,
   syncDynadotAccount,
-  syncCFAccount,
+  syncCFAccount, syncAll,
   getCFAccountDetail, cfAccountCleanup,
   getDomains, getDnsRecords, deleteDomainFromCF,
 } from '../api/client'
@@ -43,6 +43,21 @@ export default function CloudflarePage() {
     qc.invalidateQueries({ queryKey: ['dyn-all'] })
   }
 
+  // Global sync: hits backend sync_all_accounts → pulls zones + full DNS
+  // for every active CF account in parallel-ish chain.
+  const syncAllMut = useMutation({
+    mutationFn: () => syncAll().then(r => r.data),
+    onSuccess: (data) => {
+      const s = data?.stats || {}
+      toast.success(
+        `Синхронізовано ${s.accounts ?? '?'} CF акаунтів: +${s.created ?? 0} нових, ~${s.updated ?? 0} оновлено${s.errors ? ` · ${s.errors} помилок` : ''}`,
+        { duration: 6000 },
+      )
+      refresh()
+    },
+    onError: (e) => toast.error('Sync-all error: ' + (e.response?.data?.detail || e.message)),
+  })
+
   return (
     <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16, height: '100%', overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -54,9 +69,18 @@ export default function CloudflarePage() {
             Усі API-акаунти Cloudflare та Dynadot в одному місці. Команду обираєш при додаванні — не потрібно лазити по «Налаштування → команда → +».
           </p>
         </div>
-        <Btn onClick={() => setAddOpen(true)} disabled={teams.length === 0}>
-          <Plus size={14} /> Додати {tab === 'cf' ? 'CF акаунт' : 'Dynadot акаунт'}
-        </Btn>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {tab === 'cf' && (
+            <Btn variant="ghost" loading={syncAllMut.isPending}
+              onClick={() => syncAllMut.mutate()}
+              title="Запустити повну синхронізацію всіх активних CF акаунтів">
+              <RefreshCw size={14} /> Sync all
+            </Btn>
+          )}
+          <Btn onClick={() => setAddOpen(true)} disabled={teams.length === 0}>
+            <Plus size={14} /> Додати {tab === 'cf' ? 'CF акаунт' : 'Dynadot акаунт'}
+          </Btn>
+        </div>
       </div>
 
       <div style={{ display: 'flex', gap: 6, borderBottom: '1px solid var(--border)' }}>

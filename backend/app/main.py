@@ -131,9 +131,9 @@ async def lifespan(app: FastAPI):
 
     await create_default_admin()
 
-    # Auto-sync CF zones every 30 minutes — keeps the dashboard always-fresh.
-    # Original behaviour was daily 03:00; bumped because users expect real-time data.
-    scheduler.add_job(daily_sync_job, "interval", minutes=30, id="daily_sync",
+    # Auto-sync CF zones every hour — pulls zones + full DNS records for every
+    # account. Original behaviour was daily 03:00. First run 60s after startup.
+    scheduler.add_job(daily_sync_job, "interval", hours=1, id="daily_sync",
                       next_run_time=datetime.now() + timedelta(seconds=60))
     # Hourly abuse check
     scheduler.add_job(hourly_abuse_check, "interval", hours=1, id="abuse_check")
@@ -143,7 +143,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(daily_stats_report, "cron", hour=9, minute=0, id="daily_stats")
 
     scheduler.start()
-    logger.info("Scheduler started: cf_sync@30min, abuse_check@hourly, log_cleanup@04:00, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:

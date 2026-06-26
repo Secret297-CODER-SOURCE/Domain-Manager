@@ -509,14 +509,32 @@ async def stats_overview(
         .group_by(CloudflareAccount.id, CloudflareAccount.name, Team.name)
         .order_by(func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).desc())
     )).all()
+    # Live abuse-report counts per CF account (single fetch reused below for
+    # the top-suspended fallback). Empty dict on any failure.
+    abuse_by_cf_id: dict[int, int] = {}
+    abuse_cache: dict[int, list[dict]] = {}
+    try:
+        cf_accounts_active = (await db.execute(
+            select(CloudflareAccount).where(CloudflareAccount.is_active == True)
+        )).scalars().all()
+        for acc in cf_accounts_active:
+            rs = await _fetch_cf_abuse(acc)
+            abuse_cache[acc.id] = rs
+            abuse_by_cf_id[acc.id] = len(rs)
+    except Exception:
+        __import__("logging").getLogger(__name__).exception("[stats] abuse fetch failed")
+
     by_cf = [
         {
             "id": r.id, "name": r.name, "team": r.team_name,
             "total": r.total or 0, "suspended": r.suspended or 0,
+            "abuse_reports": abuse_by_cf_id.get(r.id, 0),
             "ban_rate_pct": round(((r.suspended or 0) / r.total * 100), 1) if r.total else 0,
         }
         for r in cf_rows
     ]
+    # Promote accounts with abuse reports to the top (after suspended ones)
+    by_cf.sort(key=lambda x: (x["suspended"], x["abuse_reports"]), reverse=True)
 
     # ── By TLD ────────────────────────────────────────────────────────
     tld_expr = func.lower(func.regexp_replace(Domain.name, r'^.*\.', ''))
@@ -564,14 +582,18 @@ async def stats_overview(
         .order_by(_text("1"))
     )).all()
     del_map = {r.d.isoformat(): r.deleted for r in del_timeline_rows}
+    susp_map = {r.d.isoformat(): r for r in timeline_rows}
+    # Union of all dates from both queries — otherwise deletion-only days
+    # silently disappear from the chart.
+    all_days = sorted(set(susp_map.keys()) | set(del_map.keys()))
     timeline = [
         {
-            "date": r.d.isoformat(),
-            "suspended": r.suspended or 0,
-            "recovered": r.recovered or 0,
-            "deleted": del_map.get(r.d.isoformat(), 0),
+            "date": d,
+            "suspended": (susp_map[d].suspended or 0) if d in susp_map else 0,
+            "recovered": (susp_map[d].recovered or 0) if d in susp_map else 0,
+            "deleted": del_map.get(d, 0),
         }
-        for r in timeline_rows
+        for d in all_days
     ]
 
     # ── Per-team ban trend (sparkline, last `days`) ──────────────────
@@ -615,7 +637,11 @@ async def stats_overview(
         t["cf_accounts"] = cf_by_team.get(t["id"], 0)
         t["kt_instances"] = kt_by_team.get(t["id"], 0)
 
-    # ── Top recently-suspended domains ───────────────────────────────
+    # ── Top problem domains ──────────────────────────────────────────
+    # 1) AbuseAlert rows (zone transitioned to suspended via sync)
+    # 2) Live CF abuse-reports (CF flagged but zone may still be active)
+    # Both surface here so the panel isn't misleadingly empty when CF has
+    # 300 reports but our `AbuseAlert` table is empty (no transitions yet).
     susp_rows = (await db.execute(
         select(AbuseAlert.id, Domain.name, Team.name.label("team"),
                CloudflareAccount.name.label("cf"), AbuseAlert.created_at)
@@ -628,9 +654,39 @@ async def stats_overview(
     )).all()
     top_suspended = [
         {"id": r.id, "domain": r.name, "team": r.team, "cf_account": r.cf,
-         "suspended_at": r.created_at.isoformat() if r.created_at else None}
+         "suspended_at": r.created_at.isoformat() if r.created_at else None,
+         "source": "suspended"}
         for r in susp_rows
     ]
+
+    # Fallback: live CF abuse reports (already fetched above) → top 10.
+    if len(top_suspended) < 10 and abuse_cache:
+        cf_team_name = {
+            r.id: r.team_name
+            for r in cf_rows
+        }
+        all_abuse: list[dict] = []
+        for acc_id, rs in abuse_cache.items():
+            for r in rs:
+                r2 = dict(r)
+                r2["team"] = cf_team_name.get(acc_id)
+                all_abuse.append(r2)
+        all_abuse.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        seen = {x["domain"] for x in top_suspended}
+        for r in all_abuse:
+            if len(top_suspended) >= 10:
+                break
+            if r["domain"] in seen:
+                continue
+            seen.add(r["domain"])
+            top_suspended.append({
+                "id": r.get("id"),
+                "domain": r["domain"],
+                "team": r.get("team"),
+                "cf_account": r.get("cf_account"),
+                "suspended_at": r.get("created_at"),
+                "source": f"abuse-report:{r.get('type') or '?'}",
+            })
 
     # ── Domain growth by month (last 12 months) ──────────────────────
     growth_rows = (await db.execute(

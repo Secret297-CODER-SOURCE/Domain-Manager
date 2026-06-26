@@ -10,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import (
-    CloudflareAccount, Domain, DomainStatus, RecordType, ActionLog, AbuseAlert
+    CloudflareAccount, Domain, DomainStatus, RecordType, ActionLog, AbuseAlert,
+    DnsRecord,
 )
 from app.services.cloudflare.cf_zones import fetch_zones, fetch_dns_records, verify_account
 
@@ -73,6 +74,7 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
     from app.services.cloudflare.cf_dns import detect_keitaro_direct
     now = datetime.now(timezone.utc)
 
+    dns_total = 0
     for zone, dns_records in zone_dns_pairs:
         try:
             zone_id = zone["id"]
@@ -133,7 +135,7 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
                         stats.setdefault("abuses", 0)
                         stats["abuses"] += 1
             else:
-                db.add(Domain(
+                domain = Domain(
                     cf_account_id=account.id,
                     zone_id=zone_id,
                     name=zone_name,
@@ -144,23 +146,51 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
                     direct_to_keitaro=direct_to_kt,
                     last_checked_at=now,
                     name_servers=ns_str,
-                ))
+                )
+                db.add(domain)
+                await db.flush()  # populate domain.id for FK below
                 stats["created"] += 1
+
+            # Mirror full DNS records into our table. Strategy: wipe existing
+            # rows for this domain and re-insert — cheaper than diffing CF
+            # record_ids and survives renames/value changes correctly.
+            if domain and domain.id and dns_records:
+                from sqlalchemy import delete as _delete
+                await db.execute(
+                    _delete(DnsRecord).where(DnsRecord.domain_id == domain.id)
+                )
+                for rec in dns_records:
+                    try:
+                        rt = RecordType(rec.get("type"))
+                    except (ValueError, KeyError):
+                        continue  # skip unsupported types (CAA, SPF, etc.)
+                    db.add(DnsRecord(
+                        domain_id=domain.id,
+                        cf_record_id=rec.get("id"),
+                        record_type=rt,
+                        name=rec.get("name", "")[:256],
+                        value=str(rec.get("content", ""))[:512],
+                        ttl=rec.get("ttl") or 1,
+                        proxied=bool(rec.get("proxied")),
+                    ))
+                    dns_total += 1
 
         except Exception as e:
             logger.error(f"[sync] zone error {zone.get('name')}: {e}")
             stats["errors"] += 1
 
     account.last_synced_at = now
+    stats["dns_records"] = dns_total
     db.add(ActionLog(
         action="cf_sync_account", user="system", domain=account.name,
         details=(
             f"+{stats['created']} new · ~{stats['updated']} updated · "
-            f"{stats['errors']} errors · zones={len(zones)}"
+            f"{stats['errors']} errors · zones={len(zones)} · dns={dns_total}"
         ),
     ))
     await db.flush()
-    logger.info(f"[sync] {account.name}: +{stats['created']} new, ~{stats['updated']} updated, {stats['errors']} errors")
+    logger.info(f"[sync] {account.name}: +{stats['created']} new, ~{stats['updated']} updated, "
+                f"{stats['errors']} errors, dns={dns_total}")
     return stats
 
 

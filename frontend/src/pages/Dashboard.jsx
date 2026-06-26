@@ -913,12 +913,16 @@ function TeamLeaderboardCard({ teams }) {
 }
 
 function CFAccountsCard({ accounts }) {
-  const top = accounts.filter(a => a.suspended > 0).slice(0, 8)
+  // Include any account with suspended OR live abuse-reports — otherwise the
+  // panel is empty even when CF has open reports against our domains.
+  const top = accounts
+    .filter(a => (a.suspended || 0) > 0 || (a.abuse_reports || 0) > 0)
+    .slice(0, 8)
   return (
-    <PanelCard title="CF акаунти з найбільшою ban-rate" icon={Cloud} anim="pulse">
+    <PanelCard title="CF акаунти — проблемні" icon={Cloud} anim="pulse">
       {top.length === 0 ? <Empty text="Жоден CF акаунт без проблемних зон" icon={CheckCircle} color="var(--green)" /> : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {top.map((a, i) => (
+          {top.map((a) => (
             <div key={a.id} style={{
               display: 'flex', alignItems: 'center', gap: 10,
               background: 'var(--bg3)', borderRadius: 8, padding: '8px 12px',
@@ -931,9 +935,16 @@ function CFAccountsCard({ accounts }) {
                   {a.team || '—'} · {a.total} доменів
                 </div>
               </div>
-              <span style={{ fontSize: 12, color: 'var(--red)', fontWeight: 700 }}>
-                {a.suspended} susp
-              </span>
+              {a.suspended > 0 && (
+                <span style={{ fontSize: 12, color: 'var(--red)', fontWeight: 700 }}>
+                  {a.suspended} susp
+                </span>
+              )}
+              {a.abuse_reports > 0 && (
+                <span style={{ fontSize: 12, color: 'var(--yellow)', fontWeight: 700 }}>
+                  {a.abuse_reports} abuse
+                </span>
+              )}
               <Heat pct={a.ban_rate_pct} />
             </div>
           ))}
@@ -1123,28 +1134,38 @@ function DomainGrowthCard({ growth }) {
 
 function TopSuspendedCard({ items }) {
   return (
-    <PanelCard title="Останні забанені домени" icon={Skull} anim="shake">
+    <PanelCard title="Проблемні домени" icon={Skull} anim="shake">
       {items.length === 0 ? <Empty text="Нічого не забанено" icon={CheckCircle} color="var(--green)" /> : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 240, overflowY: 'auto' }}>
-          {items.map(it => (
-            <div key={it.id} style={{
-              display: 'flex', alignItems: 'center', gap: 10,
-              background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.18)',
-              borderRadius: 7, padding: '7px 10px',
-            }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700, color: 'var(--red)',
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.domain}</div>
-                <div style={{ fontSize: 10, color: 'var(--text3)' }}>
-                  {it.team || '—'} · {it.cf_account || '—'}
+          {items.map((it, i) => {
+            const isReport = (it.source || '').startsWith('abuse-report')
+            const reportType = isReport ? it.source.split(':')[1] : null
+            return (
+              <div key={it.id ?? i} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                background: isReport ? 'rgba(245,158,11,0.06)' : 'rgba(239,68,68,0.06)',
+                border: `1px solid ${isReport ? 'rgba(245,158,11,0.20)' : 'rgba(239,68,68,0.18)'}`,
+                borderRadius: 7, padding: '7px 10px',
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700,
+                    color: isReport ? 'var(--yellow)' : 'var(--red)',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.domain}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text3)' }}>
+                    {it.team || '—'} · {it.cf_account || '—'}
+                  </div>
                 </div>
+                {reportType && (
+                  <Badge color="yellow">{reportType}</Badge>
+                )}
+                {!isReport && <Badge color="red">suspended</Badge>}
+                <span style={{ fontSize: 10, color: 'var(--text3)', whiteSpace: 'nowrap' }}>
+                  {it.suspended_at ? new Date(it.suspended_at).toLocaleString('uk-UA',
+                    { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}
+                </span>
               </div>
-              <span style={{ fontSize: 10, color: 'var(--text3)', whiteSpace: 'nowrap' }}>
-                {it.suspended_at ? new Date(it.suspended_at).toLocaleString('uk-UA',
-                  { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}
-              </span>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </PanelCard>

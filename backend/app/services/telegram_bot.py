@@ -135,6 +135,7 @@ async def check_all_zones():
 # ── Bot command handlers ───────────────────────────────────────────────────
 
 @dp.message(F.text.startswith("/start"))
+@dp.edited_message(F.text.startswith("/start"))
 async def handle_start(message: types.Message):
     username = message.from_user.username
     # Auto-activate pending admin by username
@@ -169,6 +170,7 @@ async def handle_start(message: types.Message):
 
 
 @dp.message(F.text.startswith("/myid"))
+@dp.edited_message(F.text.startswith("/myid"))
 async def handle_myid(message: types.Message):
     uid = message.from_user.id
     username = message.from_user.username or "—"
@@ -237,6 +239,7 @@ async def _get_codeword() -> str:
 # ── /fe — front-end mode lookup (any user, codeword-gated) ───────────────
 
 @dp.message(F.text.startswith("/fe"))
+@dp.edited_message(F.text.startswith("/fe"))
 async def handle_fe(message: types.Message):
     """Usage: /fe <codeword> domain1 domain2 ...
     Returns OK/BAN/PEND + team name for any matched domain, gated by codeword.
@@ -299,6 +302,7 @@ async def handle_fe(message: types.Message):
 
 
 @dp.message()
+@dp.edited_message()
 async def handle_domain_lookup(message: types.Message):
     if not message.text:
         return

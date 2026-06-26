@@ -441,6 +441,11 @@ class RemoteServer(Base):
     web_url = Column(String(512), nullable=True)
     tags = Column(String(512), nullable=True)
     notes = Column(Text, nullable=True)
+    # Procurement info — provider name + when the box was purchased.
+    # Both editable; purchased_at defaults to NOW() in the API layer when
+    # the user creates a server without specifying it.
+    provider = Column(String(128), nullable=True)
+    purchased_at = Column(DateTime(timezone=True), nullable=True)
     # Optional spreadsheet binding for two-way sync
     linked_sheet_id = Column(Integer, ForeignKey("spreadsheets.id", ondelete="SET NULL"), nullable=True)
     last_status = Column(String(32), nullable=True)    # ok | error

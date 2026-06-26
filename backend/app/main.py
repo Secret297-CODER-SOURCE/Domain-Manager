@@ -221,6 +221,9 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE dynadot_accounts ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
             "ALTER TABLE domains ADD COLUMN IF NOT EXISTS added_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
             "ALTER TABLE backup_config ADD COLUMN IF NOT EXISTS frontend_codeword VARCHAR(128)",
+            # Procurement metadata for remote servers
+            "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider VARCHAR(128)",
+            "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))

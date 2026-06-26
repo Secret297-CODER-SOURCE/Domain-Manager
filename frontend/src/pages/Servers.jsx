@@ -45,12 +45,20 @@ function ServerFormModal({ open, onClose, editing }) {
         proxy_id: editing.proxy_id ? String(editing.proxy_id) : '',
         web_url: editing.web_url || '', tags: editing.tags || '',
         notes: editing.notes || '',
+        provider: editing.provider || '',
+        // ISO datetime → "YYYY-MM-DD" for <input type=date>
+        purchased_at: editing.purchased_at
+          ? new Date(editing.purchased_at).toISOString().slice(0, 10)
+          : '',
       })
     } else {
       setForm({
         label: '', host: '', port: 22, username: 'root',
         auth_kind: 'password', password: '', private_key: '',
         proxy_id: '', web_url: '', tags: '', notes: '',
+        provider: '',
+        // Default to today on create — user can override before saving.
+        purchased_at: new Date().toISOString().slice(0, 10),
       })
     }
   }, [editing, open])
@@ -61,6 +69,11 @@ function ServerFormModal({ open, onClose, editing }) {
       payload.proxy_id = form.proxy_id ? Number(form.proxy_id) : null
       if (!payload.password) delete payload.password
       if (!payload.private_key) delete payload.private_key
+      // Trim provider and convert date input → ISO string (or null if empty)
+      payload.provider = (form.provider || '').trim() || null
+      payload.purchased_at = form.purchased_at
+        ? new Date(form.purchased_at + 'T00:00:00Z').toISOString()
+        : null
       if (editing) return (await api.patch(`/servers/${editing.id}`, payload)).data
       return (await api.post('/servers', payload)).data
     },
@@ -118,7 +131,13 @@ function ServerFormModal({ open, onClose, editing }) {
         <Field label="Web-панель URL">
           <input value={form.web_url || ''} onChange={e => setForm(f => ({ ...f, web_url: e.target.value }))} placeholder="https://1.2.3.4:9090" />
         </Field>
-        <Field label="Нотатки">
+        <Field label="Провайдер">
+          <input value={form.provider || ''} onChange={e => setForm(f => ({ ...f, provider: e.target.value }))} placeholder="Hetzner / DigitalOcean / …" />
+        </Field>
+        <Field label="Дата закупки">
+          <input type="date" value={form.purchased_at || ''} onChange={e => setForm(f => ({ ...f, purchased_at: e.target.value }))} />
+        </Field>
+        <Field label="Нотатки" style={{ gridColumn: '1 / -1' }}>
           <textarea rows={3} value={form.notes || ''} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
         </Field>
       </div>
@@ -686,6 +705,26 @@ function InfoPanel({ server, proxies, onEdit, onDelete, onTest, testing }) {
         <InfoCard title="Web-панель" value={server.web_url ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{server.web_url}</span> : '—'} />
         <InfoCard title="Тип авторизації" value={server.auth_kind === 'password' ? 'Пароль' : 'SSH-ключ'} />
         <InfoCard title="Теги" value={server.tags || '—'} />
+        <InfoCard title="Провайдер" value={server.provider || <span style={{ color: 'var(--text3)' }}>—</span>} />
+        <InfoCard title="Дата закупки" value={
+          server.purchased_at
+            ? (() => {
+                const d = new Date(server.purchased_at)
+                const days = Math.floor((Date.now() - d.getTime()) / 86400000)
+                const ageLabel = days < 1 ? 'сьогодні'
+                  : days === 1 ? 'вчора'
+                  : days < 30 ? `${days}д тому`
+                  : days < 365 ? `${Math.floor(days / 30)} міс тому`
+                  : `${Math.floor(days / 365)}р тому`
+                return (
+                  <span title={d.toLocaleString('uk-UA')}>
+                    {d.toLocaleDateString('uk-UA')}
+                    <span style={{ color: 'var(--text3)', fontSize: 11, marginLeft: 6 }}>({ageLabel})</span>
+                  </span>
+                )
+              })()
+            : <span style={{ color: 'var(--text3)' }}>—</span>
+        } />
       </div>
 
       {server.last_error && (() => {

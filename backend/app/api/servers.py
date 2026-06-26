@@ -55,6 +55,8 @@ class ServerOut(BaseModel):
     web_url: Optional[str]
     tags: Optional[str]
     notes: Optional[str]
+    provider: Optional[str] = None
+    purchased_at: Optional[datetime] = None
     linked_sheet_id: Optional[int]
     last_status: Optional[str]
     last_status_at: Optional[datetime]
@@ -76,6 +78,8 @@ class ServerIn(BaseModel):
     web_url: Optional[str] = None
     tags: Optional[str] = None
     notes: Optional[str] = None
+    provider: Optional[str] = None
+    purchased_at: Optional[datetime] = None
 
 
 class ServerPatch(BaseModel):
@@ -90,6 +94,8 @@ class ServerPatch(BaseModel):
     web_url: Optional[str] = None
     tags: Optional[str] = None
     notes: Optional[str] = None
+    provider: Optional[str] = None
+    purchased_at: Optional[datetime] = None
     linked_sheet_id: Optional[int] = None
 
 
@@ -210,6 +216,7 @@ async def list_servers(db: AsyncSession = Depends(get_db), user: User = Depends(
 
 @router.post("", response_model=ServerOut)
 async def create_server(data: ServerIn, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    from datetime import datetime as _dt, timezone as _tz
     s = RemoteServer(
         owner_user_id=user.id,
         label=data.label,
@@ -219,10 +226,15 @@ async def create_server(data: ServerIn, db: AsyncSession = Depends(get_db), user
         private_key_enc=encrypt_secret(data.private_key) if data.private_key else None,
         proxy_id=data.proxy_id, web_url=data.web_url,
         tags=data.tags, notes=data.notes,
+        provider=data.provider,
+        # Default to "now" when caller didn't specify — captures the typical
+        # workflow where the user adds the server right after buying it.
+        purchased_at=data.purchased_at or _dt.now(_tz.utc),
     )
     db.add(s)
     log_action(db, "server_add", user=user, target=data.label,
-               details={"host": data.host, "auth": data.auth_kind})
+               details={"host": data.host, "auth": data.auth_kind,
+                        "provider": data.provider})
     await db.flush(); await db.refresh(s)
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)
     return s

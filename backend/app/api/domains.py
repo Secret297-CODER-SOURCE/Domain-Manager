@@ -171,11 +171,56 @@ async def sync_cf_account(cf_account_id: int, db: AsyncSession = Depends(get_db)
     return {"ok": True, "stats": stats}
 
 
+# In-memory status of the current sync-all run. One-slot — only one global
+# sync at a time. Survives until next restart.
+_sync_all_status: dict = {"running": False, "started_at": None,
+                          "finished_at": None, "stats": None, "error": None}
+
+
+async def _sync_all_bg():
+    """Background worker for sync-all. Owns its DB session."""
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timezone as _tz
+    from sqlalchemy import text as _text
+
+    global _sync_all_status
+    _sync_all_status = {
+        "running": True,
+        "started_at": _dt.now(_tz.utc).isoformat(),
+        "finished_at": None, "stats": None, "error": None,
+    }
+    try:
+        async with AsyncSessionLocal() as bg_db:
+            stats = await sync_all_accounts(bg_db)
+            await bg_db.commit()
+        _sync_all_status["stats"] = stats
+        logger.info(f"[sync-all bg] done: {stats}")
+    except Exception as e:
+        _sync_all_status["error"] = str(e)[:500]
+        logger.exception("[sync-all bg] failed")
+    finally:
+        from datetime import datetime as _dt, timezone as _tz
+        _sync_all_status["running"] = False
+        _sync_all_status["finished_at"] = _dt.now(_tz.utc).isoformat()
+
+
 @router.post("/sync-all", dependencies=[Depends(require_admin)])
-async def sync_all(db: AsyncSession = Depends(get_db)):
-    stats = await sync_all_accounts(db)
-    await db.commit()
-    return {"ok": True, "stats": stats}
+async def sync_all():
+    """Start sync of all CF accounts in background. Returns immediately so
+    the proxy chain (nginx/Traefik) doesn't time out on long syncs (36
+    accounts × hundreds of zones can take many minutes)."""
+    import asyncio as _asyncio
+    if _sync_all_status.get("running"):
+        return {"ok": False, "already_running": True,
+                "started_at": _sync_all_status.get("started_at")}
+    _asyncio.create_task(_sync_all_bg())
+    return {"ok": True, "started": True}
+
+
+@router.get("/sync-all/status", dependencies=[Depends(require_admin)])
+async def sync_all_status():
+    """Poll the in-memory status of the most recent sync-all run."""
+    return _sync_all_status
 
 
 @router.post("/bulk-dns", dependencies=[Depends(require_admin)])

@@ -10,7 +10,7 @@ import {
   getAllCFAccounts, createCFAccount, updateCFAccount, deleteCFAccount,
   getDynadotAccounts, createDynadotAccount, updateDynadotAccount, deleteDynadotAccount,
   syncDynadotAccount,
-  syncCFAccount, syncAll,
+  syncCFAccount, syncAll, getSyncAllStatus,
   getCFAccountDetail, cfAccountCleanup,
   getDomains, getDnsRecords, deleteDomainFromCF,
 } from '../api/client'
@@ -43,19 +43,62 @@ export default function CloudflarePage() {
     qc.invalidateQueries({ queryKey: ['dyn-all'] })
   }
 
-  // Global sync: hits backend sync_all_accounts → pulls zones + full DNS
-  // for every active CF account in parallel-ish chain.
+  // Global sync: backend now runs sync_all_accounts in a background task so
+  // the request returns immediately. We poll /sync-all/status every 5s and
+  // surface progress via toasts. While polling, the button stays in loading.
+  const [syncAllPolling, setSyncAllPolling] = useState(false)
+
+  // Resume polling on mount if a sync is already running (e.g. user reloaded).
+  useEffect(() => {
+    let alive = true
+    getSyncAllStatus().then(r => {
+      if (alive && r.data?.running) setSyncAllPolling(true)
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  useEffect(() => {
+    if (!syncAllPolling) return
+    const toastId = 'sync-all'
+    toast.loading('Sync all триває…', { id: toastId, duration: Infinity })
+    let alive = true
+    const tick = async () => {
+      try {
+        const r = await getSyncAllStatus()
+        const s = r.data || {}
+        if (!alive) return
+        if (s.running) return // keep polling
+        // Finished
+        if (s.error) {
+          toast.error('Sync-all error: ' + s.error, { id: toastId, duration: 8000 })
+        } else if (s.stats) {
+          const st = s.stats
+          toast.success(
+            `Синхронізовано ${st.accounts ?? '?'} CF: +${st.created ?? 0} нових, ~${st.updated ?? 0} оновлено${st.errors ? ` · ${st.errors} помилок` : ''}`,
+            { id: toastId, duration: 8000 },
+          )
+        } else {
+          toast.dismiss(toastId)
+        }
+        setSyncAllPolling(false)
+        refresh()
+      } catch {}
+    }
+    const id = setInterval(tick, 5000)
+    return () => { alive = false; clearInterval(id); toast.dismiss(toastId) }
+  }, [syncAllPolling])
+
   const syncAllMut = useMutation({
     mutationFn: () => syncAll().then(r => r.data),
     onSuccess: (data) => {
-      const s = data?.stats || {}
-      toast.success(
-        `Синхронізовано ${s.accounts ?? '?'} CF акаунтів: +${s.created ?? 0} нових, ~${s.updated ?? 0} оновлено${s.errors ? ` · ${s.errors} помилок` : ''}`,
-        { duration: 6000 },
-      )
-      refresh()
+      if (data?.already_running) {
+        toast('Sync-all уже виконується', { icon: 'ℹ️' })
+      } else {
+        toast.success('Sync all запущено у фоні — слідкуй за прогресом')
+      }
+      setSyncAllPolling(true)
     },
-    onError: (e) => toast.error('Sync-all error: ' + (e.response?.data?.detail || e.message)),
+    onError: (e) => toast.error('Sync-all start error: ' + (e.response?.data?.detail || e.message)),
   })
 
   return (
@@ -71,10 +114,12 @@ export default function CloudflarePage() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {tab === 'cf' && (
-            <Btn variant="ghost" loading={syncAllMut.isPending}
+            <Btn variant="ghost"
+              loading={syncAllMut.isPending || syncAllPolling}
+              disabled={syncAllPolling}
               onClick={() => syncAllMut.mutate()}
               title="Запустити повну синхронізацію всіх активних CF акаунтів">
-              <RefreshCw size={14} /> Sync all
+              <RefreshCw size={14} /> {syncAllPolling ? 'Sync triває…' : 'Sync all'}
             </Btn>
           )}
           <Btn onClick={() => setAddOpen(true)} disabled={teams.length === 0}>

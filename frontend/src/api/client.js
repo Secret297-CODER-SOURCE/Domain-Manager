@@ -105,6 +105,7 @@ export const getStatsOverview = (days = 30) => api.get('/domains/stats/overview'
 export const getBanReasons = () => api.get('/domains/stats/ban-reasons')
 export const syncCFAccount = (cfAccountId) => api.post(`/domains/sync/${cfAccountId}`)
 export const syncAll = () => api.post('/domains/sync-all')
+export const getSyncAllStatus = () => api.get('/domains/sync-all/status')
 export const bulkUpdateDns = (data) => api.post('/domains/bulk-dns', data)
 export const addDomainsToCF = (data) => api.post('/domains/add-to-cf', data)
 export const bulkDnsByName = (data) => api.post('/domains/bulk-dns-by-name', data)

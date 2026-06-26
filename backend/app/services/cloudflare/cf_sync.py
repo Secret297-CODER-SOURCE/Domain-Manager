@@ -115,6 +115,11 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
                 domain.last_checked_at = now
                 if ns_str:
                     domain.name_servers = ns_str
+                # Backfill registered_at for domains that were added before
+                # we started capturing it. Don't overwrite once set — the
+                # CF `created_on` is immutable.
+                if not domain.registered_at and registered_at:
+                    domain.registered_at = registered_at
                 stats["updated"] += 1
 
                 # Create abuse alert if zone became suspended (or was already suspended without alert)

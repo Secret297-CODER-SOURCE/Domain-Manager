@@ -172,6 +172,27 @@ export default function DomainsPage() {
         )
       }
     },
+    {
+      key: 'registered_at', label: 'Додано в CF',
+      render: v => {
+        if (!v) return <span style={{ color: 'var(--text3)', fontSize: 11 }}>—</span>
+        const d = new Date(v)
+        const days = Math.floor((Date.now() - d.getTime()) / 86400000)
+        const ageLabel = days === 0 ? 'сьогодні'
+          : days === 1 ? 'вчора'
+          : days < 30 ? `${days}д тому`
+          : days < 365 ? `${Math.floor(days / 30)} міс тому`
+          : `${Math.floor(days / 365)}р тому`
+        return (
+          <span title={d.toLocaleString('uk-UA')} style={{ display: 'inline-flex', flexDirection: 'column', lineHeight: 1.1 }}>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>
+              {d.toLocaleDateString('uk-UA')}
+            </span>
+            <span style={{ fontSize: 9, color: 'var(--text3)' }}>{ageLabel}</span>
+          </span>
+        )
+      },
+    },
     { key: 'expires_at', label: 'Закінчення', render: v => v ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>{new Date(v).toLocaleDateString('uk-UA')}</span> : '—' },
     {
       key: 'added_by_username', label: 'Додав',

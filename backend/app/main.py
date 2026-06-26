@@ -44,6 +44,104 @@ async def cleanup_old_logs():
     logger.info("[cleanup] old logs deleted")
 
 
+async def expiry_reminder_job():
+    """Daily — warn about domains expiring in the next 4 days.
+
+    Two signals are checked:
+      * `Domain.expires_at` if Cloudflare/Dynadot sync populated it.
+      * Fallback heuristic: `registered_at + 365d` (assumes 1-year reg).
+
+    De-dup per domain: don't re-notify if we sent a reminder in the last
+    20 hours (so the cron's daily cadence triggers exactly once per day,
+    but a manual restart won't double-send).
+    """
+    from sqlalchemy import select, or_, and_, text as _text
+    from app.models.models import Domain, CloudflareAccount, Team, ActionLog
+    from app.services.telegram_bot import notify_admins
+    from app.services.audit import log_action
+
+    WARN_DAYS = 4
+
+    async with AsyncSessionLocal() as db:
+        # All candidates: real expiry within window OR estimated (registered + 1yr) within window
+        q = (
+            select(Domain, CloudflareAccount, Team)
+            .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
+            .outerjoin(Team, CloudflareAccount.team_id == Team.id)
+            .where(
+                or_(
+                    and_(
+                        Domain.expires_at.isnot(None),
+                        Domain.expires_at > _text("NOW()"),
+                        Domain.expires_at < _text(f"NOW() + INTERVAL '{WARN_DAYS} days'"),
+                    ),
+                    and_(
+                        Domain.expires_at.is_(None),
+                        Domain.registered_at.isnot(None),
+                        Domain.registered_at < _text(f"NOW() - INTERVAL '{365 - WARN_DAYS} days'"),
+                        Domain.registered_at > _text("NOW() - INTERVAL '365 days'"),
+                    ),
+                )
+            )
+        )
+        candidates = (await db.execute(q)).all()
+
+        # Filter out ones we already notified recently
+        recently_notified = {
+            r.domain for r in (await db.execute(
+                select(ActionLog).where(
+                    ActionLog.action == "domain_expiry_notified",
+                    ActionLog.created_at > _text("NOW() - INTERVAL '20 hours'"),
+                )
+            )).scalars().all()
+        }
+        fresh = [(d, a, t) for d, a, t in candidates if d.name not in recently_notified]
+        if not fresh:
+            logger.info("[expiry_reminder] no fresh expiring domains")
+            return
+
+        # Group by team
+        by_team: dict[str, list] = {}
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        now = _dt.now(_tz.utc)
+        for d, a, t in fresh:
+            tn = t.name if t else "—"
+            effective = d.expires_at or (d.registered_at + _td(days=365) if d.registered_at else None)
+            days_left = (effective - now).days if effective else None
+            by_team.setdefault(tn, []).append({
+                "name": d.name, "cf": a.name, "days_left": days_left,
+                "estimated": d.expires_at is None,
+            })
+            log_action(db, "domain_expiry_notified", user="system", target=d.name,
+                       details={"days_left": days_left, "estimated": d.expires_at is None,
+                                "team": tn, "cf": a.name})
+        await db.commit()
+
+    # Compose TG message
+    lines = [f"<b>[NAGADUVANNYA] Домени, які треба продовжити (≤{WARN_DAYS}д)</b>\n"]
+    total = sum(len(v) for v in by_team.values())
+    lines[0] = f"<b>[NAGADUVANNYA] Домени, що скоро завершуються (≤{WARN_DAYS}д) · всього {total}</b>\n"
+    for team, items in sorted(by_team.items(), key=lambda x: -len(x[1])):
+        lines.append(f"<b>{team}</b> ({len(items)}):")
+        for it in sorted(items, key=lambda x: x["days_left"] if x["days_left"] is not None else 999):
+            est = " <i>(≈)</i>" if it["estimated"] else ""
+            d_left = it["days_left"]
+            if d_left is None:
+                marker = "?"
+            elif d_left <= 0:
+                marker = "<b>СЬОГОДНІ</b>"
+            elif d_left == 1:
+                marker = "<b>завтра</b>"
+            else:
+                marker = f"за {d_left}д"
+            lines.append(f"  • <code>{it['name']}</code> — {marker}{est} · CF: <i>{it['cf']}</i>")
+        lines.append("")
+    lines.append("<i>(≈) — приблизна дата (registered_at + 1 рік), точну візьмемо з Dynadot/CF Registrar API</i>")
+
+    await notify_admins("\n".join(lines))
+    logger.info(f"[expiry_reminder] sent: {total} domains across {len(by_team)} teams")
+
+
 async def daily_stats_report():
     """Send daily domain stats per team to TG admins."""
     from app.services.telegram_bot import notify_admins
@@ -141,9 +239,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(cleanup_old_logs, "cron", hour=4, minute=0, id="log_cleanup")
     # Daily stats report at 09:00 UTC (12:00 Kyiv)
     scheduler.add_job(daily_stats_report, "cron", hour=9, minute=0, id="daily_stats")
+    # Daily expiry reminder at 08:00 UTC (11:00 Kyiv) — warn 4 days before renewal
+    scheduler.add_job(expiry_reminder_job, "cron", hour=8, minute=0, id="expiry_reminder")
 
     scheduler.start()
-    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:

@@ -5,7 +5,7 @@ import {
   Server, Plus, Trash2, Terminal as TermIcon, Globe, Wifi, X, Edit3,
   ChevronRight, Info, AlertTriangle, Loader, CheckCircle2, Circle,
   FolderTree, Folder, FolderPlus, File as FileIcon, Upload, Download,
-  ArrowUp, RefreshCw, Pencil, Copy, Eye, EyeOff,
+  ArrowUp, RefreshCw, Pencil, Copy, Eye, EyeOff, Search,
 } from 'lucide-react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
@@ -830,6 +830,21 @@ export default function ServersPage() {
   const [selectedId, setSelectedId] = useState(null)
   const [tab, setTab] = useState('info')      // info | terminal | sftp | web
   const [openTabs, setOpenTabs] = useState({}) // { [serverId]: { terminal: bool, sftp: bool, web: bool } }
+  const [search, setSearch] = useState('')
+
+  // Client-side filter — fields commonly searched for: label, host, username,
+  // tags, notes. Case-insensitive substring across all.
+  const filteredServers = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return servers
+    return servers.filter(s =>
+      (s.label || '').toLowerCase().includes(q) ||
+      (s.host || '').toLowerCase().includes(q) ||
+      (s.username || '').toLowerCase().includes(q) ||
+      (s.tags || '').toLowerCase().includes(q) ||
+      (s.notes || '').toLowerCase().includes(q)
+    )
+  }, [servers, search])
 
   useEffect(() => {
     if (!selectedId && servers.length) setSelectedId(servers[0].id)
@@ -873,12 +888,41 @@ export default function ServersPage() {
           <div style={{ padding: '14px 14px 10px', display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--border)' }}>
             <Server size={16} color="#7da3ff" />
             <div style={{ fontWeight: 700, fontSize: 14 }}>Сервери</div>
-            <div style={{ fontSize: 10, color: 'var(--text3)' }}>· {servers.length}</div>
+            <div style={{ fontSize: 10, color: 'var(--text3)' }}>
+              · {search ? `${filteredServers.length}/${servers.length}` : servers.length}
+            </div>
             <div style={{ flex: 1 }} />
             <button onClick={() => { setEditing(null); setAddOpen(true) }} title="Додати"
               style={{ background: 'var(--accent)', border: 'none', borderRadius: 6, color: '#fff', cursor: 'pointer', width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <Plus size={14} />
             </button>
+          </div>
+          {/* Search */}
+          <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', position: 'relative' }}>
+            <Search size={12} style={{
+              position: 'absolute', left: 18, top: '50%', transform: 'translateY(-50%)',
+              color: 'var(--text3)', pointerEvents: 'none',
+            }} />
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Пошук: ім'я / host / тег…"
+              style={{
+                width: '100%', padding: '6px 26px 6px 28px', fontSize: 12,
+                background: 'var(--bg3)', border: '1px solid var(--border)',
+                borderRadius: 6, color: 'var(--text)',
+              }}
+            />
+            {search && (
+              <button onClick={() => setSearch('')}
+                style={{
+                  position: 'absolute', right: 16, top: '50%', transform: 'translateY(-50%)',
+                  background: 'none', border: 'none', color: 'var(--text3)',
+                  cursor: 'pointer', padding: 0, display: 'flex',
+                }}>
+                <X size={12} />
+              </button>
+            )}
           </div>
           <div style={{ flex: 1, overflowY: 'auto', padding: 6 }}>
             {isLoading && <div style={{ padding: 20, textAlign: 'center' }}><Spinner /></div>}
@@ -887,7 +931,12 @@ export default function ServersPage() {
                 Натисніть «+» щоб додати перший сервер.
               </div>
             )}
-            {servers.map(s => (
+            {!isLoading && servers.length > 0 && filteredServers.length === 0 && (
+              <div style={{ padding: 16, fontSize: 12, color: 'var(--text3)', textAlign: 'center' }}>
+                Нічого не знайдено за «{search}»
+              </div>
+            )}
+            {filteredServers.map(s => (
               <ServerRow key={s.id} server={s} active={s.id === selectedId}
                 proxy={proxies.find(p => p.id === s.proxy_id)}
                 onClick={() => { setSelectedId(s.id); setTab('info') }} />

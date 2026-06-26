@@ -741,6 +741,12 @@ function DomainRow({ domain, expanded, onToggle, onDelete }) {
             {domain.main_record_type}: {(domain.main_record_value || '').slice(0, 30)}
           </span>
         )}
+        {domain.registered_at && (
+          <span title={`Додано в CF: ${new Date(domain.registered_at).toLocaleString('uk-UA')}`}
+            style={{ fontSize: 10, color: 'var(--text3)', whiteSpace: 'nowrap' }}>
+            {new Date(domain.registered_at).toLocaleDateString('uk-UA')}
+          </span>
+        )}
         <div onClick={e => e.stopPropagation()}>
           <Btn size="sm" variant="danger" onClick={onDelete} title="Видалити з CF + БД">
             <Trash2 size={11} />

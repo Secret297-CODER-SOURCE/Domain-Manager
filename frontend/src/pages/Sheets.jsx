@@ -14,7 +14,7 @@ import * as XLSX from 'xlsx'
 
 import api, {
   getSheets, createSheet, getSheet, updateSheet, deleteSheet, renameSheet,
-  createServerTechAccessSheet,
+  createServerTechAccessSheet, getTechAccessInfo,
 } from '../api/client'
 import { Btn, Spinner, Modal, Field, Badge } from '../components/ui/index'
 import { useDeleteOtp } from '../context/DeleteOtpContext'
@@ -200,14 +200,15 @@ function SheetList({ onOpen, sheets }) {
     onSuccess: () => { toast.success('Таблицю видалено'); qc.invalidateQueries(['sheets']) },
   })
 
-  // Auto-create / reuse server-tech-access sheet.
+  const [techModal, setTechModal] = useState(false)
+  // Auto-create / reuse server-tech-access sheet (local or Google).
   const techMut = useMutation({
-    mutationFn: () => createServerTechAccessSheet().then(r => r.data),
+    mutationFn: (params) => createServerTechAccessSheet(params).then(r => r.data),
     onSuccess: (r) => {
       if (r.reused) toast('Таблиця тех-доступів уже існує — відкриваю', { icon: 'ℹ️' })
-      else toast.success('Таблицю тех-доступів створено')
+      else toast.success(`Таблицю тех-доступів створено (${r.kind})`)
       qc.invalidateQueries(['sheets'])
-      // Open the new/existing sheet in a tab.
+      setTechModal(false)
       if (r.sheet_id) onOpen?.(r.sheet_id)
     },
     onError: (e) => toast.error('Помилка: ' + (e.response?.data?.detail || e.message)),
@@ -263,9 +264,9 @@ function SheetList({ onOpen, sheets }) {
           <Btn variant="ghost" onClick={() => setImportModal(true)}>
             <Download size={14} /> Імпорт у Domain Manager
           </Btn>
-          <Btn variant="ghost" loading={techMut.isPending}
+          <Btn variant="ghost"
             title="Створити таблицю з полями: команда, провайдер, email, пароль, IP, пароль SSH, дата закупки. Автоматично заповниться даними з усіх серверів і буде оновлюватись при змінах."
-            onClick={() => techMut.mutate()}>
+            onClick={() => setTechModal(true)}>
             <KeyRound size={14} /> Тех-доступи
           </Btn>
           <Btn onClick={() => setNewModal(true)}>
@@ -313,7 +314,115 @@ function SheetList({ onOpen, sheets }) {
         onUnlocked={(id, password) => { setUnlockSheet(null); onOpen(id, password) }} />
       <BindingModal sheet={bindSheet} onClose={() => setBindSheet(null)} />
       <GoogleImportModal open={importModal} onClose={() => setImportModal(false)} />
+      <TechAccessModal open={techModal} onClose={() => setTechModal(false)}
+        onCreate={(params) => techMut.mutate(params)}
+        loading={techMut.isPending} />
     </div>
+  )
+}
+
+
+// ─── Tech-access preset modal (local OR Google) ─────────────────────────
+
+function TechAccessModal({ open, onClose, onCreate, loading }) {
+  const [kind, setKind] = useState('local')
+  const [url, setUrl] = useState('')
+  const { data: info } = useQuery({
+    queryKey: ['techaccess-info'],
+    queryFn: () => getTechAccessInfo().then(r => r.data),
+    enabled: open,
+    staleTime: 60_000,
+  })
+  const googleReady = info?.google_configured
+  const saEmail = info?.service_account_email
+
+  if (!open) return null
+  return (
+    <Modal open={open} onClose={onClose} title="Створити таблицю тех-доступів">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <p style={{ margin: 0, fontSize: 13, color: 'var(--text2)' }}>
+          Колонки: <b>Команда · Провайдер · Email · Пароль провайдера · IP ·
+          Пароль сервера · Дата закупки</b>. Заповниться з усіх існуючих серверів
+          і буде <b>оновлюватись автоматично</b> при будь-яких змінах.
+        </p>
+
+        {/* Kind switch */}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={() => setKind('local')}
+            style={{
+              flex: 1, padding: 14, borderRadius: 10, cursor: 'pointer', textAlign: 'left',
+              background: kind === 'local' ? 'var(--accent-dim)' : 'var(--bg2)',
+              border: `1px solid ${kind === 'local' ? 'var(--accent)' : 'var(--border)'}`,
+              color: 'var(--text)',
+            }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>
+              <FileSpreadsheet size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+              Локально (в Domain Manager)
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+              Дані в нашій БД. Шифрування Fernet. Live-sync.
+            </div>
+          </button>
+          <button onClick={() => setKind('google')} disabled={!googleReady}
+            style={{
+              flex: 1, padding: 14, borderRadius: 10, textAlign: 'left',
+              cursor: googleReady ? 'pointer' : 'not-allowed',
+              opacity: googleReady ? 1 : 0.45,
+              background: kind === 'google' ? 'var(--accent-dim)' : 'var(--bg2)',
+              border: `1px solid ${kind === 'google' ? 'var(--accent)' : 'var(--border)'}`,
+              color: 'var(--text)',
+            }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>
+              <Globe size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+              Google Sheets
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+              {googleReady
+                ? 'Дані у вашій Google таблиці. Live-sync через Sheets API.'
+                : 'Service Account не налаштовано (env GOOGLE_SERVICE_ACCOUNT_JSON).'}
+            </div>
+          </button>
+        </div>
+
+        {kind === 'google' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {saEmail && (
+              <div style={{
+                background: 'var(--bg2)', border: '1px solid var(--border)',
+                borderRadius: 8, padding: 12, fontSize: 12,
+              }}>
+                <div style={{ marginBottom: 6 }}>
+                  1. Створи нову Google таблицю.<br />
+                  2. Натисни <b>Share</b> → додай як <b>Editor</b>:
+                </div>
+                <code style={{
+                  fontFamily: 'var(--mono)', fontSize: 12, background: 'var(--bg3)',
+                  padding: '4px 8px', borderRadius: 4, color: 'var(--accent)',
+                  userSelect: 'all', display: 'inline-block',
+                }}>{saEmail}</code>
+                <div style={{ marginTop: 6 }}>
+                  3. Скопіюй URL таблиці і встав нижче.
+                </div>
+              </div>
+            )}
+            <input value={url} onChange={e => setUrl(e.target.value)}
+              placeholder="https://docs.google.com/spreadsheets/d/…"
+              style={{ fontFamily: 'var(--mono)', fontSize: 12 }} />
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+          <Btn variant="ghost" onClick={onClose}>Скасувати</Btn>
+          <Btn loading={loading}
+            disabled={kind === 'google' && !url.trim()}
+            onClick={() => onCreate(kind === 'google'
+              ? { kind: 'google', external_url: url.trim() }
+              : { kind: 'local' })}>
+            Створити
+          </Btn>
+        </div>
+      </div>
+    </Modal>
   )
 }
 

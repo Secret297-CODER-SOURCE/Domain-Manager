@@ -142,8 +142,11 @@ export const getSheet = (id) => api.get(`/sheets/${id}`)
 export const updateSheet = (id, data) => api.patch(`/sheets/${id}`, data)
 export const deleteSheet = (id) => api.delete(`/sheets/${id}`)
 export const renameSheet = (id, name) => api.patch(`/sheets/${id}`, { name })
-// Auto-create a server-tech-access sheet with predefined columns + binding
-export const createServerTechAccessSheet = () => api.post('/sheet-sync/preset/server-techaccess')
+// Auto-create a server-tech-access sheet with predefined columns + binding.
+// `params` = { kind: 'local'|'google', external_url?: string }
+export const createServerTechAccessSheet = (params = {}) =>
+  api.post('/sheet-sync/preset/server-techaccess', params)
+export const getTechAccessInfo = () => api.get('/sheet-sync/preset/server-techaccess/info')
 
 // KeePass vaults
 export const getVaults = () => api.get('/keepass')

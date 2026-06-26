@@ -68,7 +68,23 @@ async def mirror_entity_to_sheets(db: AsyncSession, *, entity_kind: str, owner_u
                     [_attr(r, cmap[h]) for h in cmap.keys()] + [r.id]
                     for r in rows_orm
                 ]
-                sheet.data = _build_sheet_payload(headers, rows)
+                if sheet.kind == "google" and sheet.external_url:
+                    # Push to Google via service account. Wrapped in to_thread
+                    # because gspread is blocking. Errors don't break the
+                    # mirror — we record them for the user to investigate.
+                    try:
+                        import asyncio as _asyncio
+                        from app.services.google_sheets_write import (
+                            sync_to_google_sheet,
+                        )
+                        await _asyncio.to_thread(
+                            sync_to_google_sheet, sheet.external_url, headers, rows,
+                        )
+                    except Exception as e:
+                        binding.last_error = f"google: {e}"[:480]
+                        continue
+                else:
+                    sheet.data = _build_sheet_payload(headers, rows)
                 binding.last_sync_at = datetime.now(timezone.utc)
                 binding.last_error = None
             except Exception as e:

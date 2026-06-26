@@ -298,8 +298,24 @@ async def push(sheet_id: int, db: AsyncSession = Depends(get_db), user: User = D
 
 # ── Default tech-access preset (for /servers) ────────────────────────────
 
+class TechAccessIn(BaseModel):
+    kind: str = "local"          # local | google
+    external_url: Optional[str] = None  # required when kind=google
+
+
+@router.get("/preset/server-techaccess/info")
+async def techaccess_info(_: User = Depends(get_current_user)):
+    """Returns Google SA email (for sharing) + whether SA configured."""
+    from app.services.google_sheets_write import is_configured, get_service_account_email
+    return {
+        "google_configured": is_configured(),
+        "service_account_email": get_service_account_email(),
+    }
+
+
 @router.post("/preset/server-techaccess")
 async def create_server_techaccess_sheet(
+    data: TechAccessIn = TechAccessIn(),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -365,12 +381,35 @@ async def create_server_techaccess_sheet(
         for s in rows_orm
     ]
 
-    sheet = Spreadsheet(
-        owner_user_id=user.id,
-        name="Тех-доступи серверів",
-        kind="local",
-        data=_build_sheet_payload(headers, rows),
-    )
+    if data.kind == "google":
+        # Validate + write to the provided sheet via Google API. Wrap
+        # blocking gspread call in to_thread so we don't stall the loop.
+        if not data.external_url:
+            raise HTTPException(400, "external_url обовʼязковий для kind=google")
+        import asyncio as _asyncio
+        from app.services.google_sheets_write import (
+            sync_to_google_sheet, GoogleSheetsError,
+        )
+        try:
+            res = await _asyncio.to_thread(
+                sync_to_google_sheet, data.external_url, headers, rows,
+            )
+        except GoogleSheetsError as e:
+            raise HTTPException(400, str(e))
+        sheet = Spreadsheet(
+            owner_user_id=user.id,
+            name="Тех-доступи серверів",
+            kind="google",
+            external_url=data.external_url,
+            data="[]",
+        )
+    else:
+        sheet = Spreadsheet(
+            owner_user_id=user.id,
+            name="Тех-доступи серверів",
+            kind="local",
+            data=_build_sheet_payload(headers, rows),
+        )
     db.add(sheet)
     await db.flush()
 
@@ -383,4 +422,7 @@ async def create_server_techaccess_sheet(
     )
     db.add(binding)
     await db.commit()
-    return {"ok": True, "sheet_id": sheet.id, "name": sheet.name, "reused": False}
+    return {
+        "ok": True, "sheet_id": sheet.id, "name": sheet.name,
+        "reused": False, "kind": sheet.kind,
+    }

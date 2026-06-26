@@ -80,7 +80,23 @@ async def _owned_sheet(db: AsyncSession, sid: int, user: User) -> Spreadsheet:
 
 
 def _attr(obj: Any, name: str) -> Any:
+    """Read a field for sheet output. Supports virtual `_*_dec` keys that
+    point to encrypted columns (e.g. `_password_dec` → decrypt password_enc),
+    and `_team_name` resolved by the caller and stashed on the orm instance
+    as `_resolved_team_name`."""
     try:
+        if name == "_team_name":
+            return getattr(obj, "_resolved_team_name", "") or ""
+        if name.startswith("_") and name.endswith("_dec"):
+            from app.core.crypto import decrypt_secret as _dec
+            enc_attr = name[1:-4] + "_enc"  # _password_dec → password_enc
+            enc_val = getattr(obj, enc_attr, None)
+            if not enc_val:
+                return ""
+            try:
+                return _dec(enc_val)
+            except Exception:
+                return ""
         v = getattr(obj, name, None)
     except Exception:
         return None
@@ -278,3 +294,93 @@ async def push(sheet_id: int, db: AsyncSession = Depends(get_db), user: User = D
     b.last_error = "; ".join(errors[:3]) if errors else None
     await db.flush()
     return {"ok": True, "created": created, "updated": updated, "skipped": skipped, "errors": errors[:5]}
+
+
+# ── Default tech-access preset (for /servers) ────────────────────────────
+
+@router.post("/preset/server-techaccess")
+async def create_server_techaccess_sheet(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """One-click setup: creates a Spreadsheet bound to RemoteServer with the
+    pre-defined column map for tech accesses (team / provider / email /
+    pwd / IP / SSH pwd / purchase date) and immediately populates it from
+    the user's existing servers.
+
+    If a binding already exists for an `entity=servers` sheet of this user
+    we just return the existing one — no duplicates."""
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    from app.models.models import Spreadsheet, SheetBinding, RemoteServer, Team
+    from app.core.crypto import decrypt_secret as _dec
+
+    # Reuse if exists
+    existing = (await db.execute(
+        select(SheetBinding, Spreadsheet)
+        .join(Spreadsheet, Spreadsheet.id == SheetBinding.sheet_id)
+        .where(Spreadsheet.owner_user_id == user.id,
+               SheetBinding.entity == "servers")
+        .limit(1)
+    )).first()
+    if existing:
+        _, sheet = existing
+        return {"ok": True, "sheet_id": sheet.id, "name": sheet.name,
+                "reused": True}
+
+    # Column map: header → attribute on RemoteServer (special "_dec"
+    # suffix triggers decryption via _attr override below).
+    # Order matches the spec: team, provider, email, pwd, IP, SSH pwd, date.
+    column_map = {
+        "Команда":            "_team_name",
+        "Провайдер":          "provider",
+        "Email":              "provider_email",
+        "Пароль провайдера":  "_provider_password_dec",
+        "IP":                 "host",
+        "Пароль сервера":     "_password_dec",
+        "Дата закупки":       "purchased_at",
+    }
+
+    # Build rows
+    rows_orm = (await db.execute(
+        select(RemoteServer).where(RemoteServer.owner_user_id == user.id)
+    )).scalars().all()
+    team_by_id = {t.id: t.name for t in (await db.execute(select(Team))).scalars().all()}
+
+    def _row_value(srv, attr):
+        if attr == "_team_name":
+            return team_by_id.get(srv.team_id) or ""
+        if attr == "_provider_password_dec":
+            return _dec(srv.provider_password_enc) if srv.provider_password_enc else ""
+        if attr == "_password_dec":
+            return _dec(srv.password_enc) if srv.password_enc else ""
+        v = getattr(srv, attr, None)
+        if isinstance(v, _dt):
+            return v.isoformat()
+        return v if v is not None else ""
+
+    headers = list(column_map.keys()) + ["__id"]
+    rows = [
+        [_row_value(s, column_map[h]) for h in column_map.keys()] + [s.id]
+        for s in rows_orm
+    ]
+
+    sheet = Spreadsheet(
+        owner_user_id=user.id,
+        name="Тех-доступи серверів",
+        kind="local",
+        data=_build_sheet_payload(headers, rows),
+    )
+    db.add(sheet)
+    await db.flush()
+
+    binding = SheetBinding(
+        sheet_id=sheet.id,
+        entity="servers",
+        direction="pull",     # auto-pull on server changes
+        column_map=_json.dumps(column_map, ensure_ascii=False),
+        last_sync_at=_dt.now(_tz.utc),
+    )
+    db.add(binding)
+    await db.commit()
+    return {"ok": True, "sheet_id": sheet.id, "name": sheet.name, "reused": False}

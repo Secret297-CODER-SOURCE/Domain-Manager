@@ -50,6 +50,14 @@ async def mirror_entity_to_sheets(db: AsyncSession, *, entity_kind: str, owner_u
             select(Model).where(Model.owner_user_id == owner_user_id)
         )).scalars().all()
 
+        # Pre-resolve team names so the sync `_attr("_team_name")` doesn't
+        # need an await per row.
+        if entity_kind == "servers":
+            from app.models.models import Team as _Team
+            teams = {t.id: t.name for t in (await db.execute(select(_Team))).scalars().all()}
+            for r in rows_orm:
+                r._resolved_team_name = teams.get(getattr(r, "team_id", None), "")
+
         for binding, sheet in pairs:
             try:
                 cmap = json.loads(binding.column_map or "{}")

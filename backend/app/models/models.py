@@ -446,6 +446,12 @@ class RemoteServer(Base):
     # the user creates a server without specifying it.
     provider = Column(String(128), nullable=True)
     purchased_at = Column(DateTime(timezone=True), nullable=True)
+    # Tech-access bundle: ownership team + provider account credentials.
+    # provider_email / provider_password_enc are the login for the hosting
+    # provider's web panel (separate from the in-OS SSH password above).
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
+    provider_email = Column(String(256), nullable=True)
+    provider_password_enc = Column(Text, nullable=True)        # Fernet
     # Optional spreadsheet binding for two-way sync
     linked_sheet_id = Column(Integer, ForeignKey("spreadsheets.id", ondelete="SET NULL"), nullable=True)
     last_status = Column(String(32), nullable=True)    # ok | error

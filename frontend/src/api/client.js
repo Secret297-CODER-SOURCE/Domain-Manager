@@ -142,6 +142,8 @@ export const getSheet = (id) => api.get(`/sheets/${id}`)
 export const updateSheet = (id, data) => api.patch(`/sheets/${id}`, data)
 export const deleteSheet = (id) => api.delete(`/sheets/${id}`)
 export const renameSheet = (id, name) => api.patch(`/sheets/${id}`, { name })
+// Auto-create a server-tech-access sheet with predefined columns + binding
+export const createServerTechAccessSheet = () => api.post('/sheet-sync/preset/server-techaccess')
 
 // KeePass vaults
 export const getVaults = () => api.get('/keepass')

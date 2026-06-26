@@ -11,7 +11,7 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 
-import api from '../api/client'
+import api, { getTeams } from '../api/client'
 import { Btn, Modal, Spinner, Field } from '../components/ui/index'
 import { useAuthStore } from '../store/auth'
 
@@ -33,6 +33,12 @@ const useProxies = () => useQuery({
 function ServerFormModal({ open, onClose, editing }) {
   const qc = useQueryClient()
   const { data: proxies = [] } = useProxies()
+  const { data: teams = [] } = useQuery({
+    queryKey: ['teams'],
+    queryFn: () => getTeams().then(r => r.data),
+    enabled: open,
+    staleTime: 60_000,
+  })
   const [form, setForm] = useState({})
 
   useEffect(() => {
@@ -50,6 +56,11 @@ function ServerFormModal({ open, onClose, editing }) {
         purchased_at: editing.purchased_at
           ? new Date(editing.purchased_at).toISOString().slice(0, 10)
           : '',
+        team_id: editing.team_id ? String(editing.team_id) : '',
+        provider_email: editing.provider_email || '',
+        // Show stored value (admin-only field decrypted by backend) so user
+        // doesn't have to re-type it when editing other fields.
+        provider_password: editing.provider_password || '',
       })
     } else {
       setForm({
@@ -59,6 +70,7 @@ function ServerFormModal({ open, onClose, editing }) {
         provider: '',
         // Default to today on create — user can override before saving.
         purchased_at: new Date().toISOString().slice(0, 10),
+        team_id: '', provider_email: '', provider_password: '',
       })
     }
   }, [editing, open])
@@ -74,6 +86,10 @@ function ServerFormModal({ open, onClose, editing }) {
       payload.purchased_at = form.purchased_at
         ? new Date(form.purchased_at + 'T00:00:00Z').toISOString()
         : null
+      // Tech-access bundle
+      payload.team_id = form.team_id ? Number(form.team_id) : null
+      payload.provider_email = (form.provider_email || '').trim() || null
+      payload.provider_password = form.provider_password || null
       if (editing) return (await api.patch(`/servers/${editing.id}`, payload)).data
       return (await api.post('/servers', payload)).data
     },
@@ -136,6 +152,20 @@ function ServerFormModal({ open, onClose, editing }) {
         </Field>
         <Field label="Дата закупки">
           <input type="date" value={form.purchased_at || ''} onChange={e => setForm(f => ({ ...f, purchased_at: e.target.value }))} />
+        </Field>
+        <Field label="Команда">
+          <select value={form.team_id || ''} onChange={e => setForm(f => ({ ...f, team_id: e.target.value }))}>
+            <option value="">— Без команди —</option>
+            {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Email у провайдера">
+          <input type="email" value={form.provider_email || ''} onChange={e => setForm(f => ({ ...f, provider_email: e.target.value }))} placeholder="ops@example.com" />
+        </Field>
+        <Field label="Пароль провайдера" style={{ gridColumn: '1 / -1' }}>
+          <input type="password" autoComplete="off" value={form.provider_password || ''}
+            onChange={e => setForm(f => ({ ...f, provider_password: e.target.value }))}
+            placeholder={editing ? 'залиш пустим щоб не міняти' : ''} />
         </Field>
         <Field label="Нотатки" style={{ gridColumn: '1 / -1' }}>
           <textarea rows={3} value={form.notes || ''} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
@@ -705,7 +735,18 @@ function InfoPanel({ server, proxies, onEdit, onDelete, onTest, testing }) {
         <InfoCard title="Web-панель" value={server.web_url ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{server.web_url}</span> : '—'} />
         <InfoCard title="Тип авторизації" value={server.auth_kind === 'password' ? 'Пароль' : 'SSH-ключ'} />
         <InfoCard title="Теги" value={server.tags || '—'} />
+        <InfoCard title="Команда" value={server.team_name || <span style={{ color: 'var(--text3)' }}>—</span>} />
         <InfoCard title="Провайдер" value={server.provider || <span style={{ color: 'var(--text3)' }}>—</span>} />
+        <InfoCard title="Email провайдера" value={
+          server.provider_email
+            ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{server.provider_email}</span>
+            : <span style={{ color: 'var(--text3)' }}>—</span>
+        } />
+        <InfoCard title="Пароль провайдера" value={
+          server.provider_password
+            ? <ProviderPasswordCell value={server.provider_password} />
+            : <span style={{ color: 'var(--text3)' }}>—</span>
+        } />
         <InfoCard title="Дата закупки" value={
           server.purchased_at
             ? (() => {
@@ -825,6 +866,32 @@ function RowKV({ k, v }) {
         </button>
       </span>
     </>
+  )
+}
+
+function ProviderPasswordCell({ value }) {
+  const [shown, setShown] = useState(false)
+  function copy() {
+    navigator.clipboard.writeText(value).then(
+      () => toast.success('Пароль скопійовано'),
+      () => toast.error('Не вдалося скопіювати'),
+    )
+  }
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)', userSelect: shown ? 'text' : 'none' }}>
+        {shown ? value : '•'.repeat(Math.min(value.length, 12))}
+      </span>
+      <button onClick={() => setShown(s => !s)}
+        title={shown ? 'Сховати' : 'Показати'}
+        style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 0, display: 'flex' }}>
+        {shown ? <EyeOff size={12} /> : <Eye size={12} />}
+      </button>
+      <button onClick={copy} title="Копіювати"
+        style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', padding: 0, display: 'flex' }}>
+        <Copy size={12} />
+      </button>
+    </div>
   )
 }
 

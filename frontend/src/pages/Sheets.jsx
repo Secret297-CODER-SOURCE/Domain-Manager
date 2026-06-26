@@ -7,13 +7,14 @@ import {
   Plus, Trash2, Download, Upload, FileSpreadsheet, Save,
   Lock, Unlock, X, LayoutGrid, Globe, ExternalLink, RefreshCw, Link2,
   Server, Mail as MailIcon, FileText, ChevronRight, ChevronDown, ArrowLeft, ArrowRight,
-  Check, AlertTriangle, RotateCw, XCircle, CheckCircle2, Sparkles,
+  Check, AlertTriangle, RotateCw, XCircle, CheckCircle2, Sparkles, KeyRound,
 } from 'lucide-react'
 import { saveAs } from 'file-saver'
 import * as XLSX from 'xlsx'
 
 import api, {
   getSheets, createSheet, getSheet, updateSheet, deleteSheet, renameSheet,
+  createServerTechAccessSheet,
 } from '../api/client'
 import { Btn, Spinner, Modal, Field, Badge } from '../components/ui/index'
 import { useDeleteOtp } from '../context/DeleteOtpContext'
@@ -199,6 +200,19 @@ function SheetList({ onOpen, sheets }) {
     onSuccess: () => { toast.success('Таблицю видалено'); qc.invalidateQueries(['sheets']) },
   })
 
+  // Auto-create / reuse server-tech-access sheet.
+  const techMut = useMutation({
+    mutationFn: () => createServerTechAccessSheet().then(r => r.data),
+    onSuccess: (r) => {
+      if (r.reused) toast('Таблиця тех-доступів уже існує — відкриваю', { icon: 'ℹ️' })
+      else toast.success('Таблицю тех-доступів створено')
+      qc.invalidateQueries(['sheets'])
+      // Open the new/existing sheet in a tab.
+      if (r.sheet_id) onOpen?.(r.sheet_id)
+    },
+    onError: (e) => toast.error('Помилка: ' + (e.response?.data?.detail || e.message)),
+  })
+
   async function importXlsx(file) {
     try {
       const buf = await file.arrayBuffer()
@@ -248,6 +262,11 @@ function SheetList({ onOpen, sheets }) {
           </Btn>
           <Btn variant="ghost" onClick={() => setImportModal(true)}>
             <Download size={14} /> Імпорт у Domain Manager
+          </Btn>
+          <Btn variant="ghost" loading={techMut.isPending}
+            title="Створити таблицю з полями: команда, провайдер, email, пароль, IP, пароль SSH, дата закупки. Автоматично заповниться даними з усіх серверів і буде оновлюватись при змінах."
+            onClick={() => techMut.mutate()}>
+            <KeyRound size={14} /> Тех-доступи
           </Btn>
           <Btn onClick={() => setNewModal(true)}>
             <Plus size={14} /> Нова таблиця

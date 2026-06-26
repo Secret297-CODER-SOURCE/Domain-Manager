@@ -224,6 +224,9 @@ async def lifespan(app: FastAPI):
             # Procurement metadata for remote servers
             "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider VARCHAR(128)",
             "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ",
+            "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL",
+            "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider_email VARCHAR(256)",
+            "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider_password_enc TEXT",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))

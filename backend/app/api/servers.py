@@ -35,7 +35,7 @@ from app.core.security import get_current_user
 from app.services.audit import log_action
 from jose import jwt, JWTError
 from app.db.session import get_db, AsyncSessionLocal
-from app.models.models import RemoteServer, Proxy, User, Domain, DnsRecord, Spreadsheet
+from app.models.models import RemoteServer, Proxy, User, Domain, DnsRecord, Spreadsheet, Team
 from app.services.sheet_mirror import mirror_entity_to_sheets
 
 
@@ -57,6 +57,12 @@ class ServerOut(BaseModel):
     notes: Optional[str]
     provider: Optional[str] = None
     purchased_at: Optional[datetime] = None
+    team_id: Optional[int] = None
+    team_name: Optional[str] = None
+    provider_email: Optional[str] = None
+    # Decrypted on read (admin-only field — same security posture as the
+    # existing mail/server SSH password endpoints).
+    provider_password: Optional[str] = None
     linked_sheet_id: Optional[int]
     last_status: Optional[str]
     last_status_at: Optional[datetime]
@@ -80,6 +86,9 @@ class ServerIn(BaseModel):
     notes: Optional[str] = None
     provider: Optional[str] = None
     purchased_at: Optional[datetime] = None
+    team_id: Optional[int] = None
+    provider_email: Optional[str] = None
+    provider_password: Optional[str] = None
 
 
 class ServerPatch(BaseModel):
@@ -96,10 +105,27 @@ class ServerPatch(BaseModel):
     notes: Optional[str] = None
     provider: Optional[str] = None
     purchased_at: Optional[datetime] = None
+    team_id: Optional[int] = None
+    provider_email: Optional[str] = None
+    provider_password: Optional[str] = None
     linked_sheet_id: Optional[int] = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+async def _to_out(s: RemoteServer, db: AsyncSession) -> ServerOut:
+    """Populate ServerOut with decrypted secrets + joined team name."""
+    out = ServerOut.model_validate(s)
+    if s.provider_password_enc:
+        try:
+            out.provider_password = decrypt_secret(s.provider_password_enc)
+        except Exception:
+            out.provider_password = None
+    if s.team_id:
+        t = await db.get(Team, s.team_id)
+        out.team_name = t.name if t else None
+    return out
+
 
 async def _owned(db: AsyncSession, sid: int, user: User) -> RemoteServer:
     s = await db.get(RemoteServer, sid)
@@ -211,7 +237,8 @@ async def _ssh_connect(s: RemoteServer, db: AsyncSession, *, term: bool = False)
 @router.get("", response_model=List[ServerOut])
 async def list_servers(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     q = select(RemoteServer).where(RemoteServer.owner_user_id == user.id).order_by(RemoteServer.id.desc())
-    return (await db.execute(q)).scalars().all()
+    rows = (await db.execute(q)).scalars().all()
+    return [await _to_out(s, db) for s in rows]
 
 
 @router.post("", response_model=ServerOut)
@@ -230,14 +257,17 @@ async def create_server(data: ServerIn, db: AsyncSession = Depends(get_db), user
         # Default to "now" when caller didn't specify — captures the typical
         # workflow where the user adds the server right after buying it.
         purchased_at=data.purchased_at or _dt.now(_tz.utc),
+        team_id=data.team_id,
+        provider_email=data.provider_email,
+        provider_password_enc=encrypt_secret(data.provider_password) if data.provider_password else None,
     )
     db.add(s)
     log_action(db, "server_add", user=user, target=data.label,
                details={"host": data.host, "auth": data.auth_kind,
-                        "provider": data.provider})
+                        "provider": data.provider, "team_id": data.team_id})
     await db.flush(); await db.refresh(s)
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)
-    return s
+    return await _to_out(s, db)
 
 
 @router.patch("/{sid}", response_model=ServerOut)
@@ -249,12 +279,15 @@ async def update_server(sid: int, data: ServerPatch, db: AsyncSession = Depends(
             if v: s.password_enc = encrypt_secret(v); changes["password_rotated"] = True
         elif k == "private_key":
             if v: s.private_key_enc = encrypt_secret(v); changes["key_rotated"] = True
+        elif k == "provider_password":
+            # Distinct from SSH password above — provider panel login.
+            if v: s.provider_password_enc = encrypt_secret(v); changes["provider_password_rotated"] = True
         else:
             setattr(s, k, v); changes[k] = v
     log_action(db, "server_update", user=user, target=s.label, details=changes)
     await db.flush(); await db.refresh(s)
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)
-    return s
+    return await _to_out(s, db)
 
 
 @router.delete("/{sid}")

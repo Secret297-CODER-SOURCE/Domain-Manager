@@ -7,7 +7,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api, notifications as notifications_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -142,6 +142,85 @@ async def expiry_reminder_job():
     logger.info(f"[expiry_reminder] sent: {total} domains across {len(by_team)} teams")
 
 
+async def server_payment_reminder_job():
+    """Daily — when there are ≤4 days left until end of month, remind about
+    paying for all the user's servers. Picks up team/provider context so the
+    TG message is actionable.
+
+    De-dup: keeps a 20h window via ActionLog `server_payment_reminded`, so
+    if the cron fires twice the user doesn't get a second blast.
+    """
+    from sqlalchemy import select, text as _text
+    from app.models.models import RemoteServer, Team, ActionLog
+    from app.services.telegram_bot import notify_admins
+    from app.services.audit import log_action
+    from datetime import date as _date, timedelta as _td
+    from calendar import monthrange
+
+    today = _date.today()
+    last_day = monthrange(today.year, today.month)[1]
+    days_left = last_day - today.day
+
+    if days_left > 4:
+        logger.info(f"[server_payment] {days_left}d left to month end — too early")
+        return
+
+    async with AsyncSessionLocal() as db:
+        servers = (await db.execute(
+            select(RemoteServer).order_by(RemoteServer.team_id, RemoteServer.label)
+        )).scalars().all()
+        if not servers:
+            return
+
+        # Already notified in last 20 hours?
+        notified = {
+            r.domain for r in (await db.execute(
+                select(ActionLog).where(
+                    ActionLog.action == "server_payment_reminded",
+                    ActionLog.created_at > _text("NOW() - INTERVAL '20 hours'"),
+                )
+            )).scalars().all()
+        }
+        fresh = [s for s in servers if s.label not in notified]
+        if not fresh:
+            logger.info("[server_payment] all servers already notified today")
+            return
+
+        team_by_id = {
+            t.id: t.name for t in (await db.execute(select(Team))).scalars().all()
+        }
+        by_team: dict[str, list] = {}
+        for s in fresh:
+            tn = team_by_id.get(s.team_id) or "—"
+            by_team.setdefault(tn, []).append({
+                "label": s.label, "host": s.host,
+                "provider": s.provider or "—",
+            })
+            log_action(
+                db, "server_payment_reminded", user="system", target=s.label,
+                details={"team": tn, "provider": s.provider, "host": s.host,
+                         "days_left": days_left},
+            )
+        await db.commit()
+
+    # Compose TG
+    total = sum(len(v) for v in by_team.values())
+    lines = [
+        f"<b>[NAGADUVANNYA] Оплата серверів — {days_left}д до кінця місяця</b>",
+        f"Всього серверів: <b>{total}</b>\n",
+    ]
+    for team, items in sorted(by_team.items(), key=lambda x: -len(x[1])):
+        lines.append(f"<b>{team}</b> ({len(items)}):")
+        for it in items:
+            lines.append(
+                f"  • <code>{it['label']}</code> · {it['host']} · "
+                f"<i>{it['provider']}</i>"
+            )
+        lines.append("")
+    await notify_admins("\n".join(lines))
+    logger.info(f"[server_payment] sent: {total} servers across {len(by_team)} teams")
+
+
 async def daily_stats_report():
     """Send daily domain stats per team to TG admins."""
     from app.services.telegram_bot import notify_admins
@@ -247,9 +326,13 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(daily_stats_report, "cron", hour=9, minute=0, id="daily_stats")
     # Daily expiry reminder at 08:00 UTC (11:00 Kyiv) — warn 4 days before renewal
     scheduler.add_job(expiry_reminder_job, "cron", hour=8, minute=0, id="expiry_reminder")
+    # Daily server-payment reminder at 08:30 UTC — fires only in the last
+    # 4 days of each month; falls through harmlessly the rest of the time.
+    scheduler.add_job(server_payment_reminder_job, "cron", hour=8, minute=30,
+                      id="server_payment_reminder")
 
     scheduler.start()
-    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, server_payment@08:30, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:
@@ -316,6 +399,7 @@ app.include_router(sheet_sync.router)
 app.include_router(sheet_import.router)
 app.include_router(dynadot_api.router)
 app.include_router(public_api.router)
+app.include_router(notifications_api.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

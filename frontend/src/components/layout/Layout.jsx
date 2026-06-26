@@ -2,6 +2,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox, StickyNote, Server, Cloud } from 'lucide-react'
 import { useAuthStore } from '../../store/auth'
 import toast from 'react-hot-toast'
+import NotificationBell from '../NotificationBell'
 
 export default function Layout() {
   const { user, logout } = useAuthStore()
@@ -46,10 +47,11 @@ export default function Layout() {
             <div style={{ width: 32, height: 32, background: 'var(--accent)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <Database size={16} color="#fff" />
             </div>
-            <div>
+            <div style={{ flex: 1 }}>
               <div style={{ fontWeight: 800, fontSize: 14 }}>DomainMgr</div>
               <div style={{ fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>v1.0</div>
             </div>
+            <NotificationBell />
           </div>
         </div>
 

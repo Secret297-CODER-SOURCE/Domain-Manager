@@ -148,6 +148,10 @@ export const createServerTechAccessSheet = (params = {}) =>
   api.post('/sheet-sync/preset/server-techaccess', params)
 export const getTechAccessInfo = () => api.get('/sheet-sync/preset/server-techaccess/info')
 
+// In-panel notifications feed (server payments, domain expiries)
+export const getNotifications = (days = 7, limit = 100) =>
+  api.get('/notifications', { params: { days, limit } })
+
 // KeePass vaults
 export const getVaults = () => api.get('/keepass')
 export const uploadVault = (name, file, rememberMaster) => {

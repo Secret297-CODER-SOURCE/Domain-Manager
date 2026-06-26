@@ -29,6 +29,7 @@ from app.models.models import (
     Domain, DnsRecord, AbuseAlert, ActionLog, TelegramAdmin,
     Spreadsheet, KeepassVault, KeepassShare, Proxy,
     BackupConfig, BackupRun, Purchase, KumaInstance, Identity, MailAccount,
+    DynadotAccount, Note, EmbeddedService, RemoteServer, SheetBinding,
 )
 
 BACKUP_VERSION = 1
@@ -39,6 +40,7 @@ EXPORTED_TABLES = [
     ("users",                  User,                 None, set()),
     ("teams",                  Team,                 None, set()),
     ("cloudflare_accounts",    CloudflareAccount,    None, set()),
+    ("dynadot_accounts",       DynadotAccount,       None, set()),
     ("keitaro_instances",      KeitaroInstance,      None, set()),
     ("keitaro_domain_groups",  KeitaroDomainGroup,   None, set()),
     ("domains",                Domain,               None, set()),
@@ -54,6 +56,10 @@ EXPORTED_TABLES = [
     ("kuma_instances",         KumaInstance,         None, set()),
     ("identities",             Identity,             None, set()),
     ("mail_accounts",          MailAccount,          None, set()),
+    ("notes",                  Note,                 None, set()),
+    ("embedded_services",      EmbeddedService,      None, set()),
+    ("remote_servers",         RemoteServer,         None, set()),
+    ("sheet_bindings",         SheetBinding,         None, set()),
     ("backup_config",          BackupConfig,         None, set()),
     # NOTE: backup_runs intentionally excluded — meta about backups themselves
 ]

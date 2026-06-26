@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.models import (
     Domain, CloudflareAccount, Team, AbuseAlert, DomainStatus,
-    DnsRecord, TelegramAdmin,
+    DnsRecord, TelegramAdmin, BackupConfig,
 )
 from app.services.cloudflare.cf_zones import get_zone_status
 from app.services.cloudflare.cf_dns import delete_record as cf_delete_record
@@ -14,6 +14,9 @@ from app.services.cloudflare.cf_dns import delete_record as cf_delete_record
 logger = logging.getLogger(__name__)
 bot: Bot = None
 dp = Dispatcher()
+
+PLATFORM_URL = "https://domain-manage.tech/"
+PLATFORM_FOOTER = f'\n\n— <a href="{PLATFORM_URL}">domain-manage.tech</a>'
 
 
 def get_bot() -> Bot:
@@ -36,11 +39,13 @@ async def notify_admins(text: str):
     b = get_bot()
     if not b:
         return
+    body = text + PLATFORM_FOOTER
     async with AsyncSessionLocal() as db:
         chat_ids = await get_active_chat_ids(db)
     for cid in chat_ids:
         try:
-            await b.send_message(chat_id=cid, text=text, parse_mode="HTML")
+            await b.send_message(chat_id=cid, text=body, parse_mode="HTML",
+                                  disable_web_page_preview=True)
         except Exception as e:
             logger.error(f"TG notify error to {cid}: {e}")
 
@@ -100,12 +105,12 @@ async def check_all_zones():
 
                     # Notify all admins (info only, no buttons needed)
                     text = (
-                        f"🚨 <b>ABUSE / SUSPENDED — DNS видалено</b>\n\n"
-                        f"🌐 Домен: <code>{domain.name}</code>\n"
-                        f"👥 Команда: <b>{team.name}</b>\n"
-                        f"☁️ CF акаунт: <b>{account.name}</b>\n"
-                        f"📁 Група KT: <b>{kt_group_name}</b>\n"
-                        f"🗑 Видалено DNS записів: <b>{deleted_count}</b>"
+                        f"<b>[ABUSE / SUSPENDED — DNS видалено]</b>\n\n"
+                        f"Домен: <code>{domain.name}</code>\n"
+                        f"Команда: <b>{team.name}</b>\n"
+                        f"CF акаунт: <b>{account.name}</b>\n"
+                        f"Група KT: <b>{kt_group_name}</b>\n"
+                        f"Видалено DNS записів: <b>{deleted_count}</b>"
                     )
                     asyncio.create_task(notify_admins(text))
 
@@ -146,15 +151,20 @@ async def handle_start(message: types.Message):
                 pending.chat_id = str(message.from_user.id)
                 await db.commit()
                 await message.reply(
-                    f"✅ <b>Активовано!</b> Тепер ви будете отримувати сповіщення про абузи та OTP коди.",
-                    parse_mode="HTML",
+                    "<b>[OK] Активовано!</b> Тепер ви будете отримувати сповіщення про абузи та OTP коди."
+                    + PLATFORM_FOOTER,
+                    parse_mode="HTML", disable_web_page_preview=True,
                 )
                 return
 
     await message.reply(
-        f"👋 <b>DomainMgr Bot</b>\n\n"
-        f"Надішліть список доменів (по одному на рядок) — отримаєте відповідь по кожному.",
-        parse_mode="HTML",
+        "<b>DomainMgr Bot</b>\n\n"
+        "Надішліть список доменів (по одному на рядок) — відповім, чи це наш домен.\n\n"
+        "<b>Front-end режим</b>:\n"
+        "<code>/fe &lt;кодове слово&gt; домен1 домен2</code>\n"
+        "Покаже статус і назву команди, якщо кодове слово вірне."
+        + PLATFORM_FOOTER,
+        parse_mode="HTML", disable_web_page_preview=True,
     )
 
 
@@ -163,9 +173,10 @@ async def handle_myid(message: types.Message):
     uid = message.from_user.id
     username = message.from_user.username or "—"
     await message.reply(
-        f"🆔 Ваш Telegram ID: <code>{uid}</code>\n"
-        f"👤 Username: @{username}",
-        parse_mode="HTML",
+        f"Ваш Telegram ID: <code>{uid}</code>\n"
+        f"Username: @{username}"
+        + PLATFORM_FOOTER,
+        parse_mode="HTML", disable_web_page_preview=True,
     )
 
 
@@ -175,6 +186,116 @@ async def _is_tg_admin(chat_id: int) -> bool:
             select(TelegramAdmin).where(TelegramAdmin.chat_id == str(chat_id))
         )
         return result.scalar_one_or_none() is not None
+
+
+def _parse_domains(text: str) -> list[str]:
+    """Pull domain-like tokens out of arbitrary text. Strips scheme/path/leading
+    `www.` and lowercases. Keeps tokens with a `.` and length > 3."""
+    out = []
+    for line in text.splitlines():
+        for part in line.replace(",", " ").replace(";", " ").split():
+            t = part.strip().lower()
+            for pref in ("http://", "https://"):
+                if t.startswith(pref):
+                    t = t[len(pref):]
+            t = t.split("/", 1)[0]
+            if t.startswith("www."):
+                t = t[4:]
+            if "." in t and len(t) > 3:
+                out.append(t)
+    return out
+
+
+STATUS_TAG = {
+    "DomainStatus.active": "[OK]", "DomainStatus.suspended": "[BAN]",
+    "DomainStatus.pending": "[PEND]", "DomainStatus.unknown": "[?]",
+    "active": "[OK]", "suspended": "[BAN]",
+    "pending": "[PEND]", "unknown": "[?]",
+}
+
+
+async def _lookup_domains(candidates: list[str]) -> dict[str, tuple]:
+    """Return {name: (Domain, CloudflareAccount, Team)} for given names."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Domain, CloudflareAccount, Team)
+            .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
+            .outerjoin(Team, CloudflareAccount.team_id == Team.id)
+            .where(Domain.name.in_(candidates))
+        )
+        return {d.name: (d, a, t) for d, a, t in result.all()}
+
+
+async def _get_codeword() -> str:
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(
+            select(BackupConfig).where(BackupConfig.id == 1)
+        )).scalar_one_or_none()
+        return (cfg.frontend_codeword or "").strip() if cfg else ""
+
+
+# ── /fe — front-end mode lookup (any user, codeword-gated) ───────────────
+
+@dp.message(F.text.startswith("/fe"))
+async def handle_fe(message: types.Message):
+    """Usage: /fe <codeword> domain1 domain2 ...
+    Returns OK/BAN/PEND + team name for any matched domain, gated by codeword.
+    Lets non-admin front-end engineers verify ownership and team without
+    granting them full admin role."""
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "<b>Front-end перевірка</b>\n\n"
+            "Використання: <code>/fe &lt;кодове слово&gt; домен1 домен2 ...</code>\n\n"
+            "Покаже статус + команду для кожного домену, якщо кодове слово вірне."
+            + PLATFORM_FOOTER,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        return
+
+    provided_cw = parts[1].strip()
+    rest = parts[2]
+
+    stored_cw = await _get_codeword()
+    if not stored_cw:
+        await message.reply(
+            "Front-end режим не налаштовано. Зверніться до адміна." + PLATFORM_FOOTER,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        return
+    if provided_cw != stored_cw:
+        await message.reply("Невірне кодове слово." + PLATFORM_FOOTER,
+                             parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    candidates = _parse_domains(rest)
+    if not candidates:
+        await message.reply(
+            "Не знайдено доменів. Приклад: <code>/fe секрет example.com test.org</code>"
+            + PLATFORM_FOOTER,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        return
+
+    found = await _lookup_domains(candidates)
+    lines = []
+    for domain in candidates:
+        if domain in found:
+            d, a, t = found[domain]
+            tag = STATUS_TAG.get(str(d.zone_status), "[?]")
+            team_str = t.name if t else "?"
+            lines.append(
+                f"{tag} <code>{domain}</code> — <b>{team_str}</b> · CF: <i>{a.name}</i>"
+            )
+        else:
+            lines.append(f"[—] <code>{domain}</code> — немає в системі")
+
+    chunks = [lines[i:i + 30] for i in range(0, len(lines), 30)]
+    for idx, chunk in enumerate(chunks):
+        text = "\n".join(chunk)
+        if idx == len(chunks) - 1:
+            text += PLATFORM_FOOTER
+        await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message()
@@ -197,53 +318,40 @@ async def handle_domain_lookup(message: types.Message):
                 pending.chat_id = str(message.from_user.id)
                 await db.commit()
 
-    # Parse domain names from the message
-    raw = message.text.strip()
-    candidates = []
-    for line in raw.splitlines():
-        for part in line.replace(",", " ").replace(";", " ").split():
-            part = part.strip().lower().lstrip("http://").lstrip("https://").split("/")[0]
-            if "." in part and len(part) > 3:
-                candidates.append(part)
-
+    candidates = _parse_domains(message.text.strip())
     if not candidates:
-        await message.reply("Надішліть список доменів (по одному на рядок).")
+        await message.reply(
+            "Надішліть список доменів (по одному на рядок).\n"
+            "Для перевірки з назвою команди (для не-адмінів) використай:\n"
+            "<code>/fe &lt;кодове слово&gt; домен1 домен2</code>"
+            + PLATFORM_FOOTER,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
         return
 
     is_admin = await _is_tg_admin(message.from_user.id)
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Domain, CloudflareAccount, Team)
-            .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
-            .outerjoin(Team, CloudflareAccount.team_id == Team.id)
-            .where(Domain.name.in_(candidates))
-        )
-        found = {d.name: (d, a, t) for d, a, t in result.all()}
-
-    STATUS_EMOJI = {
-        "active": "✅", "suspended": "🚨", "pending": "⏳", "unknown": "❓"
-    }
+    found = await _lookup_domains(candidates)
 
     lines = []
     for domain in candidates:
         if domain in found:
             if is_admin:
                 d, a, t = found[domain]
-                emoji = STATUS_EMOJI.get(str(d.zone_status), "❓")
+                tag = STATUS_TAG.get(str(d.zone_status), "[?]")
                 team_str = t.name if t else "?"
-                lines.append(f"{emoji} <code>{domain}</code> — <b>{team_str}</b>")
+                lines.append(f"{tag} <code>{domain}</code> — <b>{team_str}</b>")
             else:
-                lines.append(f"✅ <code>{domain}</code> — є в системі")
+                lines.append(f"[OK] <code>{domain}</code> — є в системі")
         else:
-            if is_admin:
-                lines.append(f"❌ <code>{domain}</code> — немає в системі")
-            else:
-                lines.append(f"❌ <code>{domain}</code> — домен не знайдено")
+            lines.append(f"[—] <code>{domain}</code> — немає в системі")
 
     # Send in chunks of 30 to stay under TG message limit
-    for i in range(0, len(lines), 30):
-        await message.reply("\n".join(lines[i:i + 30]), parse_mode="HTML")
+    chunks = [lines[i:i + 30] for i in range(0, len(lines), 30)]
+    for idx, chunk in enumerate(chunks):
+        text = "\n".join(chunk)
+        if idx == len(chunks) - 1:
+            text += PLATFORM_FOOTER
+        await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def start_bot():

@@ -40,6 +40,13 @@ api.interceptors.response.use(
   }
 )
 
+// Public domain check (no auth needed)
+export const checkPublicDomain = (name, codeword) =>
+  axios.get('/api/public/check-domain', { params: { name, codeword: codeword || undefined } })
+       .then(r => r.data)
+export const getFrontendCodeword = () => api.get('/admin/frontend-codeword')
+export const setFrontendCodeword = (codeword) => api.put('/admin/frontend-codeword', { codeword })
+
 // Delete OTP
 export const requestDeleteOtp = () => api.post('/auth/delete-otp/request')
 export const verifyDeleteOtp = (code) => api.post('/auth/delete-otp/verify', { code })
@@ -73,6 +80,15 @@ export const getAllCFAccounts = () => api.get('/teams/cf-accounts-all')
 export const createCFAccount = (teamId, data) => api.post(`/teams/${teamId}/cf-accounts`, data)
 export const updateCFAccount = (teamId, id, data) => api.patch(`/teams/${teamId}/cf-accounts/${id}`, data)
 export const deleteCFAccount = (teamId, id) => api.delete(`/teams/${teamId}/cf-accounts/${id}`)
+export const getCFAccountDetail = (id) => api.get(`/teams/cf-accounts/${id}/detail`)
+export const cfAccountCleanup = (id, data) => api.post(`/teams/cf-accounts/${id}/cleanup`, data)
+
+// Dynadot accounts
+export const getDynadotAccounts = () => api.get('/dynadot/accounts')
+export const createDynadotAccount = (teamId, data) => api.post(`/dynadot/teams/${teamId}/accounts`, data)
+export const updateDynadotAccount = (id, data) => api.patch(`/dynadot/accounts/${id}`, data)
+export const deleteDynadotAccount = (id) => api.delete(`/dynadot/accounts/${id}`)
+export const syncDynadotAccount = (id) => api.post(`/dynadot/accounts/${id}/sync`)
 
 // KT Instances
 export const getKTInstances = (teamId) => api.get(`/teams/${teamId}/kt-instances`)
@@ -85,6 +101,8 @@ export const getDomains = (params) => api.get('/domains', { params })
 export const deleteDomainFromCF = (id) => api.delete(`/domains/${id}/full-delete`)
 export const bulkAbuseDelete = (domains) => api.post('/domains/bulk-abuse-delete', { domains })
 export const getTeamStats = () => api.get('/domains/team-stats')
+export const getStatsOverview = (days = 30) => api.get('/domains/stats/overview', { params: { days } })
+export const getBanReasons = () => api.get('/domains/stats/ban-reasons')
 export const syncCFAccount = (cfAccountId) => api.post(`/domains/sync/${cfAccountId}`)
 export const syncAll = () => api.post('/domains/sync-all')
 export const bulkUpdateDns = (data) => api.post('/domains/bulk-dns', data)

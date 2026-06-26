@@ -41,6 +41,8 @@ class DomainOut(BaseModel):
     keitaro_instance_name: Optional[str] = None
     notes: Optional[str]
     name_servers: Optional[str] = None
+    added_by_user_id: Optional[int] = None
+    added_by_username: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -100,13 +102,15 @@ async def list_domains(
     page: int = Query(1, ge=1),
     page_size: int = Query(100000, ge=1),
 ):
+    from app.models.models import User as _User
     q = (
         select(Domain, CloudflareAccount, Team,
-               KeitaroDomainGroup, KeitaroInstance)
+               KeitaroDomainGroup, KeitaroInstance, _User)
         .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
         .join(Team, CloudflareAccount.team_id == Team.id)
         .outerjoin(KeitaroDomainGroup, Domain.keitaro_group_id == KeitaroDomainGroup.id)
         .outerjoin(KeitaroInstance, KeitaroDomainGroup.keitaro_instance_id == KeitaroInstance.id)
+        .outerjoin(_User, Domain.added_by_user_id == _User.id)
     )
     filters = []
     if team_id and team_id.strip():
@@ -135,7 +139,7 @@ async def list_domains(
 
     result = await db.execute(q)
     out = []
-    for domain, account, team, kt_group, kt_inst in result.all():
+    for domain, account, team, kt_group, kt_inst, added_by in result.all():
         d = DomainOut.model_validate(domain)
         d.cf_account_name = account.name
         d.cf_account_active = account.is_active
@@ -143,6 +147,7 @@ async def list_domains(
         d.team_name = team.name
         d.keitaro_group_name = kt_group.name if kt_group else None
         d.keitaro_instance_name = kt_inst.name if kt_inst else None
+        d.added_by_username = added_by.username if added_by else None
         out.append(d)
     return out
 
@@ -398,13 +403,371 @@ async def get_team_stats(db: AsyncSession = Depends(get_db)):
     ]
 
 
+# ── Aggregated stats overview ─────────────────────────────────────────────
+
+@router.get("/stats/overview", dependencies=[Depends(get_current_user)])
+async def stats_overview(
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(30, ge=7, le=180),
+):
+    """Aggregated stats used by the Dashboard «Статистика» section.
+
+    Returns totals, ban breakdowns by team / CF account / TLD, a daily
+    timeline, and purchases summary. Designed to make it easy to spot WHERE
+    bans cluster and WHY (CF abuse report types). One round-trip — kept lean
+    enough that the dashboard can poll it without hammering the DB."""
+    from sqlalchemy import case, cast, Date
+    from app.models.models import Purchase, DynadotAccount
+
+    now = datetime.utcnow()
+
+    def _interval(d):
+        return f"NOW() - INTERVAL '{int(d)} days'"
+
+    # ── Totals ────────────────────────────────────────────────────────
+    totals_q = await db.execute(select(
+        func.count(Domain.id).label("total"),
+        func.count(case((Domain.zone_status == DomainStatus.active, 1))).label("active"),
+        func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).label("suspended"),
+        func.count(case((Domain.zone_status == DomainStatus.pending, 1))).label("pending"),
+    ))
+    tot = totals_q.one()
+    teams_count = (await db.execute(select(func.count(Team.id)))).scalar() or 0
+    cf_count = (await db.execute(select(func.count(CloudflareAccount.id)))).scalar() or 0
+    dyn_count = (await db.execute(select(func.count(DynadotAccount.id)))).scalar() or 0
+
+    # ── Bans count by period (AbuseAlert.new_status == suspended) ─────
+    from sqlalchemy import text as _text
+    ban_periods = {}
+    for label, d in (("last_24h", 1), ("last_7d", 7), ("last_30d", 30)):
+        v = (await db.execute(select(func.count(AbuseAlert.id)).where(
+            AbuseAlert.new_status == DomainStatus.suspended,
+            AbuseAlert.created_at > _text(_interval(d)),
+        ))).scalar() or 0
+        ban_periods[label] = v
+
+    # Deletions per period (ActionLog: full_delete_cf)
+    del_periods = {}
+    for label, d in (("last_24h", 1), ("last_7d", 7), ("last_30d", 30)):
+        v = (await db.execute(select(func.count(ActionLog.id)).where(
+            ActionLog.action == "full_delete_cf",
+            ActionLog.created_at > _text(_interval(d)),
+        ))).scalar() or 0
+        del_periods[label] = v
+
+    # ── By team ───────────────────────────────────────────────────────
+    team_rows = (await db.execute(
+        select(
+            Team.id, Team.name,
+            func.count(Domain.id).label("total"),
+            func.count(case((Domain.zone_status == DomainStatus.active, 1))).label("active"),
+            func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).label("suspended"),
+            func.count(case((Domain.zone_status == DomainStatus.pending, 1))).label("pending"),
+        )
+        .join(CloudflareAccount, CloudflareAccount.team_id == Team.id, isouter=True)
+        .join(Domain, Domain.cf_account_id == CloudflareAccount.id, isouter=True)
+        .group_by(Team.id, Team.name)
+        .order_by(func.count(Domain.id).desc())
+    )).all()
+
+    # Bans/deletions by team in last `days`
+    team_bans = {r.team_id: r.cnt for r in (await db.execute(
+        select(
+            CloudflareAccount.team_id.label("team_id"),
+            func.count(AbuseAlert.id).label("cnt"),
+        )
+        .join(Domain, Domain.cf_account_id == CloudflareAccount.id)
+        .join(AbuseAlert, AbuseAlert.domain_id == Domain.id)
+        .where(
+            AbuseAlert.new_status == DomainStatus.suspended,
+            AbuseAlert.created_at > _text(_interval(days)),
+        )
+        .group_by(CloudflareAccount.team_id)
+    )).all()}
+
+    by_team = []
+    for r in team_rows:
+        total = r.total or 0
+        susp = r.suspended or 0
+        by_team.append({
+            "id": r.id, "name": r.name,
+            "total": total, "active": r.active or 0,
+            "suspended": susp, "pending": r.pending or 0,
+            "bans_in_window": team_bans.get(r.id, 0),
+            "ban_rate_pct": round((susp / total * 100), 1) if total else 0,
+        })
+
+    # ── By CF account ────────────────────────────────────────────────
+    cf_rows = (await db.execute(
+        select(
+            CloudflareAccount.id, CloudflareAccount.name, Team.name.label("team_name"),
+            func.count(Domain.id).label("total"),
+            func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).label("suspended"),
+        )
+        .join(Team, Team.id == CloudflareAccount.team_id, isouter=True)
+        .join(Domain, Domain.cf_account_id == CloudflareAccount.id, isouter=True)
+        .group_by(CloudflareAccount.id, CloudflareAccount.name, Team.name)
+        .order_by(func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).desc())
+    )).all()
+    by_cf = [
+        {
+            "id": r.id, "name": r.name, "team": r.team_name,
+            "total": r.total or 0, "suspended": r.suspended or 0,
+            "ban_rate_pct": round(((r.suspended or 0) / r.total * 100), 1) if r.total else 0,
+        }
+        for r in cf_rows
+    ]
+
+    # ── By TLD ────────────────────────────────────────────────────────
+    tld_expr = func.lower(func.regexp_replace(Domain.name, r'^.*\.', ''))
+    tld_rows = (await db.execute(
+        select(
+            tld_expr.label("tld"),
+            func.count(Domain.id).label("total"),
+            func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).label("suspended"),
+        )
+        .group_by(tld_expr)
+        .order_by(func.count(case((Domain.zone_status == DomainStatus.suspended, 1))).desc())
+        .limit(15)
+    )).all()
+    by_tld = [
+        {
+            "tld": r.tld or "?",
+            "total": r.total or 0,
+            "suspended": r.suspended or 0,
+            "ban_rate_pct": round(((r.suspended or 0) / r.total * 100), 1) if r.total else 0,
+        }
+        for r in tld_rows if (r.suspended or 0) > 0 or (r.total or 0) > 0
+    ]
+
+    # ── Timeline (last `days` days) ──────────────────────────────────
+    timeline_rows = (await db.execute(
+        select(
+            cast(AbuseAlert.created_at, Date).label("d"),
+            func.count(case((AbuseAlert.new_status == DomainStatus.suspended, 1))).label("suspended"),
+            func.count(case((AbuseAlert.new_status == DomainStatus.active, 1))).label("recovered"),
+        )
+        .where(AbuseAlert.created_at > _text(_interval(days)))
+        .group_by(_text("1"))
+        .order_by(_text("1"))
+    )).all()
+    del_timeline_rows = (await db.execute(
+        select(
+            cast(ActionLog.created_at, Date).label("d"),
+            func.count(ActionLog.id).label("deleted"),
+        )
+        .where(
+            ActionLog.action == "full_delete_cf",
+            ActionLog.created_at > _text(_interval(days)),
+        )
+        .group_by(_text("1"))
+        .order_by(_text("1"))
+    )).all()
+    del_map = {r.d.isoformat(): r.deleted for r in del_timeline_rows}
+    timeline = [
+        {
+            "date": r.d.isoformat(),
+            "suspended": r.suspended or 0,
+            "recovered": r.recovered or 0,
+            "deleted": del_map.get(r.d.isoformat(), 0),
+        }
+        for r in timeline_rows
+    ]
+
+    # ── Per-team ban trend (sparkline, last `days`) ──────────────────
+    team_trend_rows = (await db.execute(
+        select(
+            CloudflareAccount.team_id.label("tid"),
+            cast(AbuseAlert.created_at, Date).label("d"),
+            func.count(AbuseAlert.id).label("c"),
+        )
+        .join(Domain, Domain.cf_account_id == CloudflareAccount.id)
+        .join(AbuseAlert, AbuseAlert.domain_id == Domain.id)
+        .where(
+            AbuseAlert.new_status == DomainStatus.suspended,
+            AbuseAlert.created_at > _text(_interval(days)),
+        )
+        .group_by(CloudflareAccount.team_id, _text("2"))
+    )).all()
+    team_trend: dict[int, dict[str, int]] = {}
+    for r in team_trend_rows:
+        team_trend.setdefault(r.tid, {})[r.d.isoformat()] = r.c
+    for t in by_team:
+        sparkline = []
+        for i in range(days - 1, -1, -1):
+            dt = (now.date().toordinal() - i)
+            from datetime import date as _date
+            iso = _date.fromordinal(dt).isoformat()
+            sparkline.append(team_trend.get(t["id"], {}).get(iso, 0))
+        t["sparkline"] = sparkline
+
+    # Per-team CF/KT counts
+    from app.models.models import KeitaroInstance as _KT
+    cf_by_team = {r.team_id: r.c for r in (await db.execute(
+        select(CloudflareAccount.team_id, func.count(CloudflareAccount.id).label("c"))
+        .group_by(CloudflareAccount.team_id)
+    )).all()}
+    kt_by_team = {r.team_id: r.c for r in (await db.execute(
+        select(_KT.team_id, func.count(_KT.id).label("c"))
+        .group_by(_KT.team_id)
+    )).all()}
+    for t in by_team:
+        t["cf_accounts"] = cf_by_team.get(t["id"], 0)
+        t["kt_instances"] = kt_by_team.get(t["id"], 0)
+
+    # ── Top recently-suspended domains ───────────────────────────────
+    susp_rows = (await db.execute(
+        select(AbuseAlert.id, Domain.name, Team.name.label("team"),
+               CloudflareAccount.name.label("cf"), AbuseAlert.created_at)
+        .join(Domain, Domain.id == AbuseAlert.domain_id)
+        .join(CloudflareAccount, CloudflareAccount.id == Domain.cf_account_id)
+        .outerjoin(Team, Team.id == CloudflareAccount.team_id)
+        .where(AbuseAlert.new_status == DomainStatus.suspended)
+        .order_by(AbuseAlert.created_at.desc())
+        .limit(10)
+    )).all()
+    top_suspended = [
+        {"id": r.id, "domain": r.name, "team": r.team, "cf_account": r.cf,
+         "suspended_at": r.created_at.isoformat() if r.created_at else None}
+        for r in susp_rows
+    ]
+
+    # ── Domain growth by month (last 12 months) ──────────────────────
+    growth_rows = (await db.execute(
+        select(
+            func.to_char(Domain.created_at, _text("'YYYY-MM'")).label("ym"),
+            func.count(Domain.id).label("c"),
+        )
+        .where(Domain.created_at > _text("NOW() - INTERVAL '12 months'"))
+        .group_by(_text("1"))
+        .order_by(_text("1"))
+    )).all()
+    domain_growth = [{"month": r.ym, "count": r.c} for r in growth_rows]
+
+    # ── Purchases (deep) ─────────────────────────────────────────────
+    purchases_total = (await db.execute(select(func.count(Purchase.id)))).scalar() or 0
+    cat_rows = (await db.execute(
+        select(Purchase.category, func.count(Purchase.id).label("c"))
+        .group_by(Purchase.category)
+        .order_by(func.count(Purchase.id).desc())
+    )).all()
+    status_rows = (await db.execute(
+        select(Purchase.status, func.count(Purchase.id).label("c"))
+        .group_by(Purchase.status)
+    )).all()
+    purchases_recent = (await db.execute(
+        select(func.count(Purchase.id)).where(
+            Purchase.purchased_at > _text(_interval(days))
+        )
+    )).scalar() or 0
+
+    # Total + per-currency spend (cost_amount is stored as string for precision)
+    all_purchases = (await db.execute(
+        select(Purchase.cost_amount, Purchase.cost_currency, Purchase.purchased_at, Purchase.category)
+    )).all()
+    spend_by_currency: dict[str, float] = {}
+    spend_by_month: dict[str, float] = {}
+    spend_by_category: dict[str, float] = {}
+    for amt, cur, dt, cat in all_purchases:
+        try:
+            v = float(str(amt).replace(",", ".")) if amt else 0
+        except Exception:
+            v = 0
+        if v <= 0:
+            continue
+        cur = (cur or "USD").upper()
+        spend_by_currency[cur] = round(spend_by_currency.get(cur, 0) + v, 2)
+        spend_by_category[cat or "other"] = round(spend_by_category.get(cat or "other", 0) + v, 2)
+        if dt:
+            ym = dt.strftime("%Y-%m")
+            spend_by_month[ym] = round(spend_by_month.get(ym, 0) + v, 2)
+
+    # Expiring soon (next 30 days)
+    expiring_soon = (await db.execute(
+        select(func.count(Purchase.id)).where(
+            Purchase.expires_at != None,
+            Purchase.expires_at > _text("NOW()"),
+            Purchase.expires_at < _text("NOW() + INTERVAL '30 days'"),
+        )
+    )).scalar() or 0
+
+    # ── Infrastructure counts ────────────────────────────────────────
+    from app.models.models import MailAccount, Proxy, RemoteServer, Identity, KeitaroInstance
+    infra = {
+        "mail_total":    (await db.execute(select(func.count(MailAccount.id)))).scalar() or 0,
+        "proxies_total": (await db.execute(select(func.count(Proxy.id)))).scalar() or 0,
+        "proxies_active": (await db.execute(select(func.count(Proxy.id)).where(Proxy.is_active == True))).scalar() or 0,
+        "proxies_ok":    (await db.execute(select(func.count(Proxy.id)).where(Proxy.last_check_ok == True))).scalar() or 0,
+        "servers_total": (await db.execute(select(func.count(RemoteServer.id)))).scalar() or 0,
+        "servers_ok":    (await db.execute(select(func.count(RemoteServer.id)).where(RemoteServer.last_status == "ok"))).scalar() or 0,
+        "identities_total": (await db.execute(select(func.count(Identity.id)))).scalar() or 0,
+        "kt_instances": (await db.execute(select(func.count(KeitaroInstance.id)))).scalar() or 0,
+    }
+
+    return {
+        "window_days": days,
+        "generated_at": now.isoformat(),
+        "totals": {
+            "teams": teams_count,
+            "cf_accounts": cf_count,
+            "dynadot_accounts": dyn_count,
+            "domains": tot.total or 0,
+            "active": tot.active or 0,
+            "suspended": tot.suspended or 0,
+            "pending": tot.pending or 0,
+        },
+        "bans": ban_periods,
+        "deletions": del_periods,
+        "by_team": by_team,
+        "by_cf_account": by_cf,
+        "by_tld": by_tld,
+        "timeline": timeline,
+        "purchases": {
+            "total": purchases_total,
+            "recent": purchases_recent,
+            "expiring_soon_30d": expiring_soon,
+            "by_category": [{"category": r.category, "count": r.c} for r in cat_rows],
+            "by_status": [{"status": r.status, "count": r.c} for r in status_rows],
+            "spend_by_currency": [{"currency": k, "amount": v} for k, v in sorted(spend_by_currency.items(), key=lambda x: -x[1])],
+            "spend_by_category": [{"category": k, "amount": v} for k, v in sorted(spend_by_category.items(), key=lambda x: -x[1])],
+            "spend_by_month": [{"month": k, "amount": v} for k, v in sorted(spend_by_month.items())],
+        },
+        "infra": infra,
+        "top_suspended": top_suspended,
+        "domain_growth": domain_growth,
+    }
+
+
+# ── CF abuse reasons aggregation ──────────────────────────────────────────
+
+@router.get("/stats/ban-reasons", dependencies=[Depends(get_current_user)])
+async def stats_ban_reasons(db: AsyncSession = Depends(get_db)):
+    """Pull live CF abuse reports, group by type & cf_account. Lets the
+    operator quickly see WHICH report types dominate (phishing / malware /
+    copyright / trademark / …) and which CF account gets flagged most."""
+    reports = await get_cf_abuse_reports(db)  # type: ignore[arg-type]
+    by_type: dict[str, int] = {}
+    by_account: dict[str, int] = {}
+    for r in reports:
+        t = (r.get("type") or "unknown").strip() or "unknown"
+        by_type[t] = by_type.get(t, 0) + 1
+        a = r.get("cf_account") or "?"
+        by_account[a] = by_account.get(a, 0) + 1
+    return {
+        "total": len(reports),
+        "by_type": [{"type": k, "count": v} for k, v in sorted(by_type.items(), key=lambda x: -x[1])],
+        "by_cf_account": [{"name": k, "count": v} for k, v in sorted(by_account.items(), key=lambda x: -x[1])],
+    }
+
+
 class AddToCFRequest(BaseModel):
     cf_account_id: int
     domains: list[str]
 
 
 @router.post("/add-to-cf", dependencies=[Depends(require_admin)])
-async def add_domains_to_cf(data: AddToCFRequest, db: AsyncSession = Depends(get_db)):
+async def add_domains_to_cf(data: AddToCFRequest, db: AsyncSession = Depends(get_db),
+                             current_user=Depends(require_admin)):
     account = await db.get(CloudflareAccount, data.cf_account_id)
     if not account:
         raise HTTPException(404, "CF account not found")
@@ -426,9 +789,11 @@ async def add_domains_to_cf(data: AddToCFRequest, db: AsyncSession = Depends(get
                 name=zone["name"],
                 zone_status=DomainStatus(zone.get("status", "pending")),
                 cf_account_id=account.id,
+                added_by_user_id=current_user.id,
             )
             db.add(domain)
-            db.add(ActionLog(action="cf_add_zone", domain=name, details=f"Added to {account.name}"))
+            db.add(ActionLog(action="cf_add_zone", domain=name, user=current_user.username,
+                              details=f"Added to {account.name}"))
             results.append({"domain": name, "status": "added"})
         else:
             errs = resp.get("errors", [])
@@ -490,7 +855,8 @@ class QuickAddRequest(BaseModel):
 
 
 @router.post("/quick-add", dependencies=[Depends(require_admin)])
-async def quick_add_domains(data: QuickAddRequest, db: AsyncSession = Depends(get_db)):
+async def quick_add_domains(data: QuickAddRequest, db: AsyncSession = Depends(get_db),
+                             current_user=Depends(require_admin)):
     """Add domains to CF, optionally set CNAME and add to KT group in one shot."""
     account = await db.get(CloudflareAccount, data.cf_account_id)
     if not account:
@@ -524,11 +890,13 @@ async def quick_add_domains(data: QuickAddRequest, db: AsyncSession = Depends(ge
                     zone_status=DomainStatus(zone.get("status", "pending")),
                     cf_account_id=account.id,
                     name_servers=",".join(ns_list) if ns_list else None,
+                    added_by_user_id=current_user.id,
                 )
                 db.add(domain_obj)
                 await db.flush()
                 await db.refresh(domain_obj)  # ensure id is populated
-                db.add(ActionLog(action="cf_add_zone", domain=name, details=f"quick-add to {account.name}"))
+                db.add(ActionLog(action="cf_add_zone", domain=name, user=current_user.username,
+                                  details=f"quick-add to {account.name}"))
                 item["cf_status"] = "added"
             else:
                 errs = resp.get("errors", [])

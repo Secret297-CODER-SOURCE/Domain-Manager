@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 from app.core.crypto import encrypt_secret, decrypt_secret
 from app.core.config import settings
 from app.core.security import get_current_user
+from app.services.audit import log_action
 from jose import jwt, JWTError
 from app.db.session import get_db, AsyncSessionLocal
 from app.models.models import RemoteServer, Proxy, User, Domain, DnsRecord, Spreadsheet
@@ -219,7 +220,10 @@ async def create_server(data: ServerIn, db: AsyncSession = Depends(get_db), user
         proxy_id=data.proxy_id, web_url=data.web_url,
         tags=data.tags, notes=data.notes,
     )
-    db.add(s); await db.flush(); await db.refresh(s)
+    db.add(s)
+    log_action(db, "server_add", user=user, target=data.label,
+               details={"host": data.host, "auth": data.auth_kind})
+    await db.flush(); await db.refresh(s)
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)
     return s
 
@@ -227,13 +231,15 @@ async def create_server(data: ServerIn, db: AsyncSession = Depends(get_db), user
 @router.patch("/{sid}", response_model=ServerOut)
 async def update_server(sid: int, data: ServerPatch, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     s = await _owned(db, sid, user)
+    changes = {}
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "password":
-            if v: s.password_enc = encrypt_secret(v)
+            if v: s.password_enc = encrypt_secret(v); changes["password_rotated"] = True
         elif k == "private_key":
-            if v: s.private_key_enc = encrypt_secret(v)
+            if v: s.private_key_enc = encrypt_secret(v); changes["key_rotated"] = True
         else:
-            setattr(s, k, v)
+            setattr(s, k, v); changes[k] = v
+    log_action(db, "server_update", user=user, target=s.label, details=changes)
     await db.flush(); await db.refresh(s)
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)
     return s
@@ -242,6 +248,7 @@ async def update_server(sid: int, data: ServerPatch, db: AsyncSession = Depends(
 @router.delete("/{sid}")
 async def delete_server(sid: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     s = await _owned(db, sid, user)
+    log_action(db, "server_delete", user=user, target=s.label, details={"host": s.host})
     await db.delete(s)
     await db.flush()
     await mirror_entity_to_sheets(db, entity_kind="servers", owner_user_id=user.id)

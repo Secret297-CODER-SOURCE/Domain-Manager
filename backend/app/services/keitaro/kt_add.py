@@ -65,7 +65,7 @@ async def add_domain_to_group(
                             json={"https_only": True},
                         )
                     if pr.status_code in (200, 201):
-                        logger.info(f"[kt_add] {domain.name} — https_only set via PATCH ✓")
+                        logger.info(f"[kt_add] {domain.name} — https_only set via PATCH (ok)")
                     else:
                         logger.warning(f"[kt_add] {domain.name} — PATCH https_only failed: {pr.status_code}")
                 except Exception as pe:

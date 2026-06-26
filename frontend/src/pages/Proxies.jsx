@@ -67,7 +67,7 @@ export default function ProxiesPage() {
     try {
       const r = await bulkTestProxies(selected)
       const { ok, fail } = r.data
-      toast.success(`Готово: ${ok} ✓ / ${fail} ✗`)
+      toast.success(`Готово: ${ok} OK · ${fail} помилок`)
       qc.invalidateQueries(['proxies'])
     } catch { toast.error('Помилка масового тесту') }
     finally { setBulkTesting(false) }

@@ -894,7 +894,7 @@ function BulkTransferModal({ open, onClose, onSuccess }) {
                     ? r.action === 'already_exists' ? '= вже є'
                     : r.action === 'moved_group' ? '→ група змінена'
                     : '+ додано'
-                    : '✗ ' + (r.detail || 'помилка')}
+                    : 'помилка: ' + (r.detail || '—')}
                 </span>
               </div>
             ))}

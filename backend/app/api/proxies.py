@@ -12,6 +12,7 @@ import httpx
 from app.db.session import get_db
 from app.models.models import Proxy, User
 from app.core.security import get_current_user
+from app.services.audit import log_action
 
 router = APIRouter(prefix="/api/proxies", tags=["proxies"])
 
@@ -145,6 +146,8 @@ async def list_proxies(db: AsyncSession = Depends(get_db), user: User = Depends(
 async def create_proxy(data: ProxyIn, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     p = Proxy(owner_user_id=user.id, **data.model_dump())
     db.add(p)
+    log_action(db, "proxy_add", user=user, target=data.label or f"{data.host}:{data.port}",
+               details={"type": data.type, "country": data.country})
     await db.flush()
     await db.refresh(p)
     return p
@@ -155,8 +158,12 @@ async def update_proxy(pid: int, data: ProxyPatch, db: AsyncSession = Depends(ge
     p = await db.get(Proxy, pid)
     if not p or p.owner_user_id != user.id:
         raise HTTPException(404, "Proxy not found")
+    changes = {}
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(p, k, v)
+        changes[k] = '<redacted>' if k == 'password' else v
+    log_action(db, "proxy_update", user=user, target=p.label or f"{p.host}:{p.port}",
+               details=changes)
     await db.flush()
     await db.refresh(p)
     return p
@@ -167,6 +174,7 @@ async def delete_proxy(pid: int, db: AsyncSession = Depends(get_db), user: User 
     p = await db.get(Proxy, pid)
     if not p or p.owner_user_id != user.id:
         raise HTTPException(404, "Proxy not found")
+    log_action(db, "proxy_delete", user=user, target=p.label or f"{p.host}:{p.port}")
     await db.delete(p)
     return {"ok": True}
 

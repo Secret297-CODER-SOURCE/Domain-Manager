@@ -2,11 +2,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,20 +77,20 @@ async def daily_stats_report():
     if not rows:
         return
 
-    lines = ["📊 <b>Щоденна статистика доменів</b>\n"]
+    lines = ["<b>[STATS] Щоденна статистика доменів</b>\n"]
     for r in rows:
-        sus = f" ⚠️{r.suspended}" if r.suspended else ""
-        pend = f" ⏳{r.pending}" if r.pending else ""
-        lines.append(f"👥 <b>{r.name}</b>: {r.total} доменів  ✅{r.active}{sus}{pend}")
+        sus = f" · suspended: {r.suspended}" if r.suspended else ""
+        pend = f" · pending: {r.pending}" if r.pending else ""
+        lines.append(f"<b>{r.name}</b>: {r.total} доменів · active: {r.active}{sus}{pend}")
 
     if deleted:
-        lines.append(f"\n🗑 <b>Видалено за 24 год ({len(deleted)}):</b>")
+        lines.append(f"\n<b>[DELETED] За 24 год ({len(deleted)}):</b>")
         for d in deleted[:20]:
             lines.append(f"  • <code>{d.domain}</code>")
         if len(deleted) > 20:
             lines.append(f"  …і ще {len(deleted) - 20}")
     else:
-        lines.append("\n✅ Видалень за 24 год не було")
+        lines.append("\n<b>[OK]</b> Видалень за 24 год не було")
 
     await notify_admins("\n".join(lines))
     logger.info(f"[daily_stats] sent, {len(rows)} teams, {len(deleted)} deleted")
@@ -117,6 +118,11 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS tags VARCHAR(512)",
             "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS notes TEXT",
             "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS linked_data TEXT",
+            # User attribution for audit trail
+            "ALTER TABLE cloudflare_accounts ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
+            "ALTER TABLE dynadot_accounts ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS added_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
+            "ALTER TABLE backup_config ADD COLUMN IF NOT EXISTS frontend_codeword VARCHAR(128)",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))
@@ -125,8 +131,10 @@ async def lifespan(app: FastAPI):
 
     await create_default_admin()
 
-    # Daily sync at 03:00 UTC
-    scheduler.add_job(daily_sync_job, "cron", hour=3, minute=0, id="daily_sync")
+    # Auto-sync CF zones every 30 minutes — keeps the dashboard always-fresh.
+    # Original behaviour was daily 03:00; bumped because users expect real-time data.
+    scheduler.add_job(daily_sync_job, "interval", minutes=30, id="daily_sync",
+                      next_run_time=datetime.now() + timedelta(seconds=60))
     # Hourly abuse check
     scheduler.add_job(hourly_abuse_check, "interval", hours=1, id="abuse_check")
     # Daily log cleanup at 04:00 UTC
@@ -135,7 +143,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(daily_stats_report, "cron", hour=9, minute=0, id="daily_stats")
 
     scheduler.start()
-    logger.info("Scheduler started: daily_sync@03:00, abuse_check@hourly, log_cleanup@04:00, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@30min, abuse_check@hourly, log_cleanup@04:00, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:
@@ -200,6 +208,8 @@ app.include_router(notes.router)
 app.include_router(servers_api.router)
 app.include_router(sheet_sync.router)
 app.include_router(sheet_import.router)
+app.include_router(dynadot_api.router)
+app.include_router(public_api.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

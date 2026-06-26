@@ -1221,7 +1221,7 @@ function HydroxideConnectModal({ open, onClose, account, initialPassword, onConn
         <button onClick={() => setShowProxy(s => !s)}
           style={{ background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', textAlign: 'left', padding: 0, fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
           {showProxy ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          Через проксі {proxyId ? '✓ обрано' : '(якщо є CAPTCHA)'}
+          Через проксі {proxyId ? '(обрано)' : '(якщо є CAPTCHA)'}
         </button>
         {showProxy && (
           <div style={{ borderLeft: '2px solid var(--border)', paddingLeft: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -1232,7 +1232,7 @@ function HydroxideConnectModal({ open, onClose, account, initialPassword, onConn
                   <option key={p.id} value={p.id}>
                     {(p.label || `${p.host}:${p.port}`)} · {p.type.toUpperCase()}
                     {p.country ? ` · ${p.country.toUpperCase()}` : ''}
-                    {p.last_check_ok ? ' ✓' : ''}
+                    {p.last_check_ok ? ' [OK]' : ''}
                   </option>
                 ))}
               </select>

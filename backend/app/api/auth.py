@@ -9,6 +9,7 @@ from app.db.session import get_db
 from app.models.models import User, UserRole, TelegramAdmin
 from app.core.security import verify_password, hash_password, create_access_token, get_current_user, require_admin, require_delete_token
 from app.core.config import settings
+from app.services.audit import log_action
 
 logger = logging.getLogger(__name__)
 
@@ -38,19 +39,29 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     result = await db.execute(select(User).where(User.username == form_data.username))
     user = result.scalar_one_or_none()
     if not user or not verify_password(form_data.password, user.hashed_password):
+        log_action(db, "login_failed", user=form_data.username,
+                   details={"reason": "invalid_credentials"})
+        await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
+        log_action(db, "login_failed", user=user.username, details={"reason": "user_disabled"})
+        await db.commit()
         raise HTTPException(status_code=403, detail="User is disabled")
     token = create_access_token({"sub": user.username})
+    log_action(db, "login_success", user=user, details={"role": user.role.value})
+    await db.commit()
     return Token(access_token=token, token_type="bearer", role=user.role, username=user.username)
 
 @router.post("/users", response_model=UserOut, dependencies=[Depends(require_admin)])
-async def create_user(data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def create_user(data: UserCreate, db: AsyncSession = Depends(get_db),
+                       actor: User = Depends(get_current_user)):
     result = await db.execute(select(User).where(User.username == data.username))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Username already exists")
     user = User(username=data.username, hashed_password=hash_password(data.password), role=data.role)
     db.add(user)
+    log_action(db, "user_create", user=actor, target=data.username,
+               details={"role": data.role.value if hasattr(data.role, 'value') else str(data.role)})
     await db.flush()
     await db.refresh(user)
     return user

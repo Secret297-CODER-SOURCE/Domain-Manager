@@ -53,8 +53,14 @@ export default function DomainsPage() {
   const { gateDelete } = useDeleteOtp()
 
   const [filters, setFilters] = useState({ search: '', team_id: '', status: '', zone: '' })
+  // Debounced version — drives the actual query so typing doesn't fire a
+  // refetch per keystroke. Selects (team/status) bypass debounce via direct merge.
+  const [debouncedFilters, setDebouncedFilters] = useState(filters)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedFilters(filters), 250)
+    return () => clearTimeout(t)
+  }, [filters])
   const [selected, setSelected] = useState([])
-  const [showAll, setShowAll] = useState(false)
 
   const [bulkModal, setBulkModal] = useState(false)
   const [bulkByNameModal, setBulkByNameModal] = useState(null) // null | 'A' | 'CNAME'
@@ -67,12 +73,10 @@ export default function DomainsPage() {
   const { data: teams = [] } = useQuery({ queryKey: ['teams'], queryFn: () => getTeams().then(r => r.data) })
 
   const hasFilter = Object.values(filters).some(Boolean)
-  const queryEnabled = hasFilter || showAll
 
-  const { data: domains = [], isLoading } = useQuery({
-    queryKey: ['domains', filters, showAll],
-    queryFn: () => getDomains({ ...filters, page: 1, page_size: showAll && !hasFilter ? 5000 : 2000 }).then(r => r.data),
-    enabled: queryEnabled,
+  const { data: domains = [], isLoading, isFetching } = useQuery({
+    queryKey: ['domains', debouncedFilters],
+    queryFn: () => getDomains({ ...debouncedFilters, page: 1, page_size: 10000 }).then(r => r.data),
     keepPreviousData: true,
     // Keep tabs consistent: always re-fetch when the tab regains focus
     // so two open tabs converge to the same backend state.
@@ -170,6 +174,12 @@ export default function DomainsPage() {
     },
     { key: 'expires_at', label: 'Закінчення', render: v => v ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>{new Date(v).toLocaleDateString('uk-UA')}</span> : '—' },
     {
+      key: 'added_by_username', label: 'Додав',
+      render: v => v
+        ? <Badge color="default">{v}</Badge>
+        : <span style={{ color: 'var(--text3)', fontSize: 11 }}>sync</span>,
+    },
+    {
       key: 'id', label: '', render: (id, row) => (
         <div style={{ display: 'flex', gap: 6 }} onClick={e => e.stopPropagation()}>
           <Btn size="sm" variant="ghost" onClick={() => setDnsModal(row)}>DNS</Btn>
@@ -194,7 +204,8 @@ export default function DomainsPage() {
           <div>
             <h1 style={{ fontWeight: 800, fontSize: 22 }}>Домени</h1>
             <p style={{ color: 'var(--text3)', fontSize: 12, marginTop: 2 }}>
-              {queryEnabled ? `${domains.length} знайдено` : 'Оберіть фільтр або натисніть «Показати всі»'}
+              {isLoading ? 'Завантаження…' : `${domains.length.toLocaleString('uk-UA')} ${hasFilter ? 'за фільтром' : 'всього'}`}
+              {isFetching && !isLoading && ' · оновлення…'}
             </p>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -212,14 +223,9 @@ export default function DomainsPage() {
                 <Zap size={14} /> Змінити DNS ({selected.length})
               </Btn>
             )}
-            {queryEnabled && domains.some(d => d.name_servers) && (
+            {domains.some(d => d.name_servers) && (
               <Btn variant="ghost" onClick={() => setNsModal(true)}>
                 <Globe size={14} /> NS записи
-              </Btn>
-            )}
-            {!showAll && !hasFilter && (
-              <Btn variant="ghost" onClick={() => setShowAll(true)}>
-                Показати всі
               </Btn>
             )}
             {isAdmin && (
@@ -262,8 +268,8 @@ export default function DomainsPage() {
             value={filters.zone} onChange={e => setFilter('zone', e.target.value)}
             style={{ flex: '0 1 130px' }}
           />
-          {(hasFilter || showAll) && (
-            <Btn size="sm" variant="ghost" onClick={() => { setFilters({ search: '', team_id: '', status: '', zone: '' }); setShowAll(false) }}>
+          {hasFilter && (
+            <Btn size="sm" variant="ghost" onClick={() => setFilters({ search: '', team_id: '', status: '', zone: '' })}>
               <X size={13} /> Очистити
             </Btn>
           )}
@@ -273,10 +279,12 @@ export default function DomainsPage() {
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'auto', flex: 1 }}>
           {isLoading
             ? <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}><Spinner /></div>
-            : !queryEnabled
-              ? <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 64, gap: 16, color: 'var(--text3)' }}>
-                  <span style={{ fontSize: 14 }}>Оберіть фільтр вище або завантажте всі домени</span>
-                  <Btn onClick={() => setShowAll(true)}>Показати всі ({'>'}6000)</Btn>
+            : domains.length === 0
+              ? <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 64, gap: 12, color: 'var(--text3)' }}>
+                  <Globe size={28} style={{ opacity: 0.4 }} />
+                  <span style={{ fontSize: 13 }}>
+                    {hasFilter ? 'Нічого не знайдено за фільтром' : 'Доменів ще немає'}
+                  </span>
                 </div>
               : <Table columns={columns} data={domains} selected={selected} onSelect={setSelected} />
           }

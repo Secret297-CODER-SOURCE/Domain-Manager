@@ -18,6 +18,7 @@ import aiohttp
 from app.db.session import AsyncSessionLocal
 from app.core.config import settings
 from app.services import iframe_proxy
+from app.services.audit import log_action
 
 from app.db.session import get_db
 from app.models.models import MailAccount, User
@@ -301,7 +302,10 @@ async def create_account(data: AccountIn, db: AsyncSession = Depends(get_db), us
             color=data.color, last_check_at=None,
             last_unread=None, last_total=None, last_error=None,
         )
-        db.add(a); await db.flush(); await db.refresh(a)
+        db.add(a)
+        log_action(db, "mail_account_add", user=user, target=data.email,
+                   details={"provider": host, "credential_only": True})
+        await db.flush(); await db.refresh(a)
         return a
 
     # Validate credentials first for real IMAP providers
@@ -322,6 +326,8 @@ async def create_account(data: AccountIn, db: AsyncSession = Depends(get_db), us
         last_unread=r.get("unread"), last_total=r.get("total"),
     )
     db.add(a)
+    log_action(db, "mail_account_add", user=user, target=data.email,
+               details={"provider": host, "port": port, "ssl": ssl})
     await db.flush()
     await db.refresh(a)
     return a
@@ -330,11 +336,16 @@ async def create_account(data: AccountIn, db: AsyncSession = Depends(get_db), us
 @router.patch("/{aid}", response_model=AccountOut)
 async def update_account(aid: int, data: AccountPatch, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     a = await _owned(db, aid, user)
+    changes = {}
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "password":
-            if v: a.password_enc = encrypt_secret(v)
+            if v:
+                a.password_enc = encrypt_secret(v)
+                changes["password_rotated"] = True
         else:
             setattr(a, k, v)
+            changes[k] = v
+    log_action(db, "mail_account_update", user=user, target=a.email, details=changes)
     await db.flush()
     await db.refresh(a)
     try:
@@ -348,6 +359,7 @@ async def update_account(aid: int, data: AccountPatch, db: AsyncSession = Depend
 @router.delete("/{aid}")
 async def delete_account(aid: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     a = await _owned(db, aid, user)
+    log_action(db, "mail_account_delete", user=user, target=a.email)
     await db.delete(a)
     return {"ok": True}
 

@@ -50,6 +50,7 @@ class Team(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     cloudflare_accounts = relationship("CloudflareAccount", back_populates="team", cascade="all, delete-orphan")
     keitaro_instances = relationship("KeitaroInstance", back_populates="team", cascade="all, delete-orphan")
+    dynadot_accounts = relationship("DynadotAccount", back_populates="team", cascade="all, delete-orphan")
 
 
 class CloudflareAccount(Base):
@@ -62,9 +63,27 @@ class CloudflareAccount(Base):
     api_key = Column(Text, nullable=False)
     is_active = Column(Boolean, default=True)
     last_synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     team = relationship("Team", back_populates="cloudflare_accounts")
     domains = relationship("Domain", back_populates="cf_account", cascade="all, delete-orphan")
+    __table_args__ = (UniqueConstraint("team_id", "name"),)
+
+
+class DynadotAccount(Base):
+    """Dynadot registrar account — for domain purchase / DNS management via Dynadot API."""
+    __tablename__ = "dynadot_accounts"
+    id = Column(Integer, primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(128), nullable=False)
+    api_key = Column(Text, nullable=False)
+    is_active = Column(Boolean, default=True)
+    last_synced_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(512), nullable=True)
+    domains_count = Column(Integer, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    team = relationship("Team", back_populates="dynadot_accounts")
     __table_args__ = (UniqueConstraint("team_id", "name"),)
 
 
@@ -110,6 +129,7 @@ class Domain(Base):
     notes = Column(Text, nullable=True)
     name_servers = Column(String(512), nullable=True)  # comma-separated NS, e.g. "ada.ns.cf.com,bob.ns.cf.com"
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    added_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     cf_account = relationship("CloudflareAccount", back_populates="domains")
@@ -368,6 +388,11 @@ class BackupConfig(Base):
     sftp_username = Column(String(128), nullable=True)
     sftp_password = Column(String(512), nullable=True)
     sftp_path = Column(String(512), nullable=True, default="/")
+
+    # Reused as a generic singleton-config row: shared password for the
+    # public /check page's «Front-end» mode (gives extra info — team name —
+    # when correct).
+    frontend_codeword = Column(String(128), nullable=True)
 
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 

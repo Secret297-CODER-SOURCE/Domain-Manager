@@ -23,6 +23,8 @@ import KumaPage from './pages/Kuma'
 import IdentitiesPage from './pages/Identities'
 import MailPage from './pages/Mail'
 import ServicesPage from './pages/Services'
+import CloudflarePage from './pages/Cloudflare'
+import CheckPage from './pages/Check'
 import NotesPage from './pages/Notes'
 import ServersPage from './pages/Servers'
 
@@ -30,7 +32,7 @@ const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 3
 
 function RequireAuth({ children }) {
   const { token } = useAuthStore()
-  return token ? children : <Navigate to="/login" replace />
+  return token ? children : <Navigate to="/check" replace />
 }
 
 function RequireAdmin({ children }) {
@@ -54,6 +56,7 @@ export default function App() {
       <DeleteOtpProvider>
         <BrowserRouter>
           <Routes>
+            <Route path="/check" element={<CheckPage />} />
             <Route path="/login" element={<LoginPage />} />
             <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
               <Route index element={<Navigate to="/dashboard" replace />} />
@@ -68,6 +71,7 @@ export default function App() {
               <Route path="identities" element={<IdentitiesPage />} />
               <Route path="mail"       element={<MailPage />} />
               <Route path="services"   element={<ServicesPage />} />
+              <Route path="cloudflare" element={<CloudflarePage />} />
               <Route path="servers"    element={<ServersPage />} />
               <Route path="notes"      element={<NotesPage />} />
               <Route path="passwords" element={<RequireAdmin><PasswordsPage /></RequireAdmin>} />
@@ -76,7 +80,7 @@ export default function App() {
               <Route path="users"     element={<RequireAdmin><UsersPage /></RequireAdmin>} />
               <Route path="logs"      element={<RequireAdmin><LogsPage /></RequireAdmin>} />
             </Route>
-            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            <Route path="*" element={<Navigate to="/check" replace />} />
           </Routes>
         </BrowserRouter>
         <Toaster

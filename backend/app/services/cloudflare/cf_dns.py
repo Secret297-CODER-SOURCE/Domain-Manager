@@ -182,7 +182,7 @@ async def bulk_swap_records(
     if new_type == "A":
         is_direct = await detect_keitaro_direct(new_value, db)
         if is_direct:
-            warnings.append(f"⚠️ IP {new_value} належить Keitaro інстансу! Домени будуть направлені напряму на KT без проксі.")
+            warnings.append(f"[!] IP {new_value} належить Keitaro інстансу — домени будуть направлені напряму на KT без проксі.")
 
     for domain, account in rows:
         r = await swap_main_record(domain, account, new_type, new_value, proxied, db)

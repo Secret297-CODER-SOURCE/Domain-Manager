@@ -152,6 +152,13 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
             stats["errors"] += 1
 
     account.last_synced_at = now
+    db.add(ActionLog(
+        action="cf_sync_account", user="system", domain=account.name,
+        details=(
+            f"+{stats['created']} new · ~{stats['updated']} updated · "
+            f"{stats['errors']} errors · zones={len(zones)}"
+        ),
+    ))
     await db.flush()
     logger.info(f"[sync] {account.name}: +{stats['created']} new, ~{stats['updated']} updated, {stats['errors']} errors")
     return stats

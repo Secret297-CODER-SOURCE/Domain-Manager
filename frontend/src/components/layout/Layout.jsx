@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox, StickyNote, Server } from 'lucide-react'
+import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox, StickyNote, Server, Cloud } from 'lucide-react'
 import { useAuthStore } from '../../store/auth'
 import toast from 'react-hot-toast'
 
@@ -27,6 +27,7 @@ export default function Layout() {
     { to: '/mail',       icon: Inbox,          label: 'Пошта' },
     { to: '/servers',    icon: Server,         label: 'Сервери' },
     { to: '/services',   icon: Globe,          label: 'Сервіси' },
+    { to: '/cloudflare', icon: Cloud,          label: 'Cloudflare' },
     { to: '/notes',      icon: StickyNote,     label: 'Нотатки' },
   ]
   const adminNav = [

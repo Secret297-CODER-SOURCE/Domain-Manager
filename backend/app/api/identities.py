@@ -15,6 +15,7 @@ from app.db.session import get_db
 from app.models.models import Identity, User
 from app.core.security import get_current_user
 from app.services.identity_profiles import synth_for, PROFILES
+from app.services.audit import log_action
 
 router = APIRouter(prefix="/api/identities", tags=["identities"])
 
@@ -343,15 +344,21 @@ async def list_locations(_: User = Depends(get_current_user)):
 
 
 @router.post("/generate", response_model=IdentityData)
-async def generate(loc: str = Query("random"), _: User = Depends(get_current_user)):
-    return await fetch_one(loc)
+async def generate(loc: str = Query("random"), db: AsyncSession = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    result = await fetch_one(loc)
+    log_action(db, "identity_generate", user=user, target=result.country_code,
+               details={"loc": loc, "name": result.full_name})
+    await db.commit()
+    return result
 
 
 @router.post("/generate-bulk", response_model=list[IdentityData])
 async def generate_bulk(
     loc: str = Query("random"),
     count: int = Query(5, ge=1, le=20),
-    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     sem = asyncio.Semaphore(5)
 
@@ -359,7 +366,11 @@ async def generate_bulk(
         async with sem:
             return await fetch_one(loc)
 
-    return await asyncio.gather(*[one() for _ in range(count)])
+    results = await asyncio.gather(*[one() for _ in range(count)])
+    log_action(db, "identity_generate_bulk", user=user, target=loc,
+               details={"count": len(results)})
+    await db.commit()
+    return results
 
 
 # ── Saved identities ─────────────────────────────────────────────────────
@@ -374,6 +385,8 @@ async def list_saved(db: AsyncSession = Depends(get_db), user: User = Depends(ge
 async def save_identity(data: SaveIdentityIn, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     obj = Identity(owner_user_id=user.id, **data.model_dump())
     db.add(obj)
+    log_action(db, "identity_save", user=user, target=data.full_name or data.country_code,
+               details={"country": data.country_code, "label": data.label})
     await db.flush()
     await db.refresh(obj)
     return obj
@@ -401,5 +414,7 @@ async def delete_saved(iid: int, db: AsyncSession = Depends(get_db), user: User 
     obj = await db.get(Identity, iid)
     if not obj or obj.owner_user_id != user.id:
         raise HTTPException(404, "Not found")
+    log_action(db, "identity_delete", user=user, target=obj.full_name or f"#{iid}",
+               details={"country": obj.country_code})
     await db.delete(obj)
     return {"ok": True}

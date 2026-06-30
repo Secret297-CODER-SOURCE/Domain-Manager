@@ -446,6 +446,9 @@ class RemoteServer(Base):
     # the user creates a server without specifying it.
     provider = Column(String(128), nullable=True)
     purchased_at = Column(DateTime(timezone=True), nullable=True)
+    # How many months the server is prepaid for. 1 = monthly subscription;
+    # 6 / 12 = bulk payment. Renewal date = purchased_at + paid_months * 1mo.
+    paid_months = Column(Integer, nullable=False, default=1)
     # Tech-access bundle: ownership team + provider account credentials.
     # provider_email / provider_password_enc are the login for the hosting
     # provider's web panel (separate from the in-OS SSH password above).

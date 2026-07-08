@@ -38,3 +38,7 @@ logs/
 coverage/
 .tox/
 .coverage
+
+# Local agent/tooling state
+.claude/
+*.xlsx

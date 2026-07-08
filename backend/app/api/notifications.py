@@ -27,6 +27,12 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 ACTION_KINDS = {
     "server_payment_reminded": "server_payment",
     "domain_expiry_notified":  "domain_expiry",
+    "payment_due_reminded":    "payment_due",
+}
+
+CATEGORY_LABELS = {
+    "license": "Ліцензія", "klo": "КЛО", "server": "Сервер",
+    "ai": "AI підписка", "vds": "ВДС", "other": "Оплата",
 }
 
 
@@ -83,6 +89,22 @@ async def list_notifications(
             est = " (≈)" if d.get("estimated") else ""
             title = f"Продовжити домен: {r.domain or '—'}"
             detail_str = f"Завершується {mark}{est} · Команда: {d.get('team', '—')}"
+        elif kind == "payment_due":
+            d = details if isinstance(details, dict) else {}
+            days = d.get("days_left")
+            mark = (
+                f"прострочено на {-days}д" if days is not None and days < 0
+                else "сьогодні" if days == 0
+                else "завтра" if days == 1
+                else f"за {days}д" if days is not None
+                else "невдовзі"
+            )
+            cat_label = CATEGORY_LABELS.get(d.get("category"), "Оплата")
+            title = f"{cat_label}: {r.domain or '—'}"
+            detail_str = (
+                f"Оплатити {mark} · Провайдер: {d.get('provider') or '—'} · "
+                f"Команда: {d.get('team') or '—'}"
+            )
         else:
             title = r.action
             detail_str = str(details)[:200] if details else None

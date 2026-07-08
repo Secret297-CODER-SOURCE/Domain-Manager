@@ -96,8 +96,15 @@ export const createKTInstance = (teamId, data) => api.post(`/teams/${teamId}/kt-
 export const deleteKTInstance = (teamId, id) => api.delete(`/teams/${teamId}/kt-instances/${id}`)
 export const updateKTInstance = (teamId, id, data) => api.patch(`/teams/${teamId}/kt-instances/${id}`, data)
 
+// CNAME targets — tracker-agnostic (KT, Binom, ...), just cname + description
+export const getCnameTargets = (teamId) => api.get(`/teams/${teamId}/cname-targets`)
+export const createCnameTarget = (teamId, data) => api.post(`/teams/${teamId}/cname-targets`, data)
+export const updateCnameTarget = (teamId, id, data) => api.patch(`/teams/${teamId}/cname-targets/${id}`, data)
+export const deleteCnameTarget = (teamId, id) => api.delete(`/teams/${teamId}/cname-targets/${id}`)
+
 // Domains
 export const getDomains = (params) => api.get('/domains', { params })
+export const getDomainsCount = (params) => api.get('/domains/count', { params })
 export const deleteDomainFromCF = (id) => api.delete(`/domains/${id}/full-delete`)
 export const bulkAbuseDelete = (domains) => api.post('/domains/bulk-abuse-delete', { domains })
 export const getTeamStats = () => api.get('/domains/team-stats')
@@ -221,6 +228,13 @@ export const getPurchases = () => api.get('/purchases')
 export const createPurchase = (data) => api.post('/purchases', data)
 export const updatePurchase = (id, data) => api.patch(`/purchases/${id}`, data)
 export const deletePurchase = (id) => api.delete(`/purchases/${id}`)
+
+// Recurring payments (licenses, KLO, servers, AI subscriptions, VDS)
+export const getPayments = () => api.get('/payments')
+export const createPayment = (data) => api.post('/payments', data)
+export const updatePayment = (id, data) => api.patch(`/payments/${id}`, data)
+export const markPaymentPaid = (id) => api.post(`/payments/${id}/mark-paid`)
+export const deletePayment = (id) => api.delete(`/payments/${id}`)
 
 // Mail (IMAP)
 export const getMailPresets = () => api.get('/mail/presets')

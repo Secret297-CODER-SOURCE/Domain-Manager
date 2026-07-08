@@ -1,11 +1,11 @@
-import { useState, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import toast from 'react-hot-toast'
-import { RefreshCw, Zap, Plus, X, Cloud, BarChart2, Copy, Globe, AlertTriangle, Search, CheckCircle2, Clock, ShieldOff, Link2Off, ArrowRight } from 'lucide-react'
+import { RefreshCw, Zap, Plus, X, Cloud, BarChart2, Copy, Globe, AlertTriangle, Search, CheckCircle2, Clock, ShieldOff, Link2Off, ArrowRight, Info, Flame } from 'lucide-react'
 import {
   getDomains, getTeams, syncAll, bulkUpdateDns, getDnsRecords, createDnsRecord, deleteDnsRecord,
   getAllCFAccounts, addDomainsToCF, bulkDnsByName, getKTInstances_all, getKTGroupsByInstance, bulkAddToKT, syncKTGroups,
-  deleteDomainFromCF, getTeamStats,
+  deleteDomainFromCF, getTeamStats, getCFAccounts, getCnameTargets, quickAddDomains,
 } from '../api/client'
 import { Trash2 } from 'lucide-react'
 import { Btn, Badge, Modal, Table, Spinner, Field } from '../components/ui/index'
@@ -46,13 +46,70 @@ function deriveDomainState(d) {
   return { color: 'default', Icon: AlertTriangle, label: 'Невідомо', hint: 'Стан не визначено' }
 }
 
+// Cloudflare assigns NS per-zone, so many domains from the same account
+// share the same pair — group by NS instead of repeating it per domain.
+function groupByNS(items) {
+  const map = new Map()
+  items.forEach(it => {
+    if (!it.name_servers?.length) return
+    const key = it.name_servers.join(',')
+    if (!map.has(key)) map.set(key, { ns: it.name_servers, domains: [] })
+    map.get(key).domains.push(it.domain)
+  })
+  return [...map.values()]
+}
+
+function GroupedNSBlocks({ groups }) {
+  if (!groups.length) return null
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+        NS для реєстратора
+      </div>
+      {groups.map((g, i) => (
+        <div key={i} style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8, padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <span style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 600 }}>
+              {g.domains.length} домен{g.domains.length > 1 ? 'ів' : ''}
+            </span>
+            <Btn size="sm" variant="ghost" onClick={() => {
+              navigator.clipboard.writeText(g.ns.join('\n'))
+              toast.success('NS скопійовано')
+            }}>
+              <Copy size={11} /> Копіювати NS
+            </Btn>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+            {g.ns.map(ns => (
+              <div key={ns} style={{
+                flex: 1, background: 'var(--bg2)', border: '1px solid var(--accent)',
+                borderRadius: 6, padding: '7px 10px', fontFamily: 'var(--mono)',
+                fontSize: 12, fontWeight: 700, color: 'var(--accent)', textAlign: 'center',
+              }}>
+                {ns}
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text3)', maxHeight: 70, overflowY: 'auto' }}>
+            {g.domains.join(', ')}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export default function DomainsPage() {
   const { user } = useAuthStore()
   const isAdmin = user?.role === 'admin'
   const qc = useQueryClient()
   const { gateDelete } = useDeleteOtp()
 
+  const PAGE_SIZE = 50
+  const DAY_OPTIONS = [7, 30, 90, 0] // 0 = "Всі"
+
   const [filters, setFilters] = useState({ search: '', team_id: '', status: '', zone: '' })
+  const [days, setDays] = useState(7)
   // Debounced version — drives the actual query so typing doesn't fire a
   // refetch per keystroke. Selects (team/status) bypass debounce via direct merge.
   const [debouncedFilters, setDebouncedFilters] = useState(filters)
@@ -61,11 +118,14 @@ export default function DomainsPage() {
     return () => clearTimeout(t)
   }, [filters])
   const [selected, setSelected] = useState([])
+  // Any filter/period change means the loaded set underneath is stale.
+  useEffect(() => { setSelected([]) }, [debouncedFilters, days])
 
   const [bulkModal, setBulkModal] = useState(false)
   const [bulkByNameModal, setBulkByNameModal] = useState(null) // null | 'A' | 'CNAME'
   const [addToCFModal, setAddToCFModal] = useState(false)
   const [addToKTModal, setAddToKTModal] = useState(false)
+  const [quickAddModal, setQuickAddModal] = useState(false)
   const [dnsModal, setDnsModal] = useState(null)
   const [addDnsModal, setAddDnsModal] = useState(null)
   const [nsModal, setNsModal] = useState(false)
@@ -73,17 +133,39 @@ export default function DomainsPage() {
   const { data: teams = [] } = useQuery({ queryKey: ['teams'], queryFn: () => getTeams().then(r => r.data) })
 
   const hasFilter = Object.values(filters).some(Boolean)
+  // Typing a specific domain name searches across all time — the days
+  // window only applies to the default/browsing view (matches backend).
+  const effectiveDays = filters.search.trim() ? 0 : days
 
-  const { data: domains = [], isLoading, isFetching } = useQuery({
-    queryKey: ['domains', debouncedFilters],
-    queryFn: () => getDomains({ ...debouncedFilters, page: 1, page_size: 10000 }).then(r => r.data),
-    keepPreviousData: true,
-    // Keep tabs consistent: always re-fetch when the tab regains focus
-    // so two open tabs converge to the same backend state.
+  const {
+    data: domainsPages, isLoading, isFetching, isFetchingNextPage,
+    fetchNextPage, hasNextPage,
+  } = useInfiniteQuery({
+    queryKey: ['domains', debouncedFilters, effectiveDays],
+    queryFn: ({ pageParam }) =>
+      getDomains({ ...debouncedFilters, page: pageParam, page_size: PAGE_SIZE, days: effectiveDays }).then(r => r.data),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, allPages) => lastPage.length < PAGE_SIZE ? undefined : allPages.length + 1,
     staleTime: 0,
     refetchOnWindowFocus: 'always',
     refetchOnMount: 'always',
   })
+  const domains = useMemo(() => domainsPages?.pages.flat() ?? [], [domainsPages])
+
+  // Infinite scroll: fire fetchNextPage() when the sentinel at the bottom
+  // of the (internally-scrolling) table container enters view.
+  const sentinelRef = useRef(null)
+  const scrollBoxRef = useRef(null)
+  useEffect(() => {
+    const el = sentinelRef.current
+    const root = scrollBoxRef.current
+    if (!el || !root) return
+    const obs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && hasNextPage && !isFetchingNextPage) fetchNextPage()
+    }, { root, rootMargin: '200px' })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [hasNextPage, isFetchingNextPage, fetchNextPage, domains.length])
 
   const { data: dnsRecords = [], isLoading: dnsLoading } = useQuery({
     queryKey: ['dns', dnsModal?.id],
@@ -126,7 +208,7 @@ export default function DomainsPage() {
     onError: () => toast.error('Помилка видалення'),
   })
 
-  function setFilter(key, val) { setFilters(f => ({ ...f, [key]: val })); setShowAll(false) }
+  function setFilter(key, val) { setFilters(f => ({ ...f, [key]: val })) }
 
   const columns = [
     { key: 'name', label: 'Домен', render: v => <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)', fontWeight: 500 }}>{v}</span> },
@@ -193,7 +275,12 @@ export default function DomainsPage() {
         )
       },
     },
-    { key: 'expires_at', label: 'Закінчення', render: v => v ? <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>{new Date(v).toLocaleDateString('uk-UA')}</span> : '—' },
+    {
+      key: 'abuse_count', label: 'Абузи',
+      render: v => v > 0
+        ? <Badge color="red"><Flame size={11} strokeWidth={2.4} /> {v}</Badge>
+        : <span style={{ color: 'var(--text3)', fontSize: 11 }}>—</span>,
+    },
     {
       key: 'added_by_username', label: 'Додав',
       render: v => v
@@ -225,8 +312,8 @@ export default function DomainsPage() {
           <div>
             <h1 style={{ fontWeight: 800, fontSize: 22 }}>Домени</h1>
             <p style={{ color: 'var(--text3)', fontSize: 12, marginTop: 2 }}>
-              {isLoading ? 'Завантаження…' : `${domains.length.toLocaleString('uk-UA')} ${hasFilter ? 'за фільтром' : 'всього'}`}
-              {isFetching && !isLoading && ' · оновлення…'}
+              {isLoading ? 'Завантаження…' : `завантажено ${domains.length.toLocaleString('uk-UA')}${hasFilter ? ' за фільтром' : ''}`}
+              {isFetching && !isLoading && !isFetchingNextPage && ' · оновлення…'}
             </p>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -289,6 +376,19 @@ export default function DomainsPage() {
             value={filters.zone} onChange={e => setFilter('zone', e.target.value)}
             style={{ flex: '0 1 130px' }}
           />
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'var(--bg3)', borderRadius: 7, padding: 3 }}>
+            {DAY_OPTIONS.map(d => (
+              <button key={d} onClick={() => setDays(d)} disabled={!!filters.search.trim()}
+                title={filters.search.trim() ? 'Пошук ігнорує період — шукає по всіх домена' : undefined}
+                style={{
+                  padding: '5px 10px', borderRadius: 5, fontSize: 11, fontWeight: 700, border: 'none',
+                  cursor: filters.search.trim() ? 'default' : 'pointer',
+                  background: days === d && !filters.search.trim() ? 'var(--accent)' : 'transparent',
+                  color: days === d && !filters.search.trim() ? '#fff' : 'var(--text3)',
+                  opacity: filters.search.trim() ? 0.5 : 1,
+                }}>{d === 0 ? 'Всі' : `${d}д`}</button>
+            ))}
+          </div>
           {hasFilter && (
             <Btn size="sm" variant="ghost" onClick={() => setFilters({ search: '', team_id: '', status: '', zone: '' })}>
               <X size={13} /> Очистити
@@ -297,17 +397,24 @@ export default function DomainsPage() {
         </div>
 
         {/* Table */}
-        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'auto', flex: 1 }}>
+        <div ref={scrollBoxRef} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'auto', flex: 1 }}>
           {isLoading
             ? <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}><Spinner /></div>
             : domains.length === 0
               ? <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 64, gap: 12, color: 'var(--text3)' }}>
                   <Globe size={28} style={{ opacity: 0.4 }} />
                   <span style={{ fontSize: 13 }}>
-                    {hasFilter ? 'Нічого не знайдено за фільтром' : 'Доменів ще немає'}
+                    {hasFilter ? 'Нічого не знайдено за фільтром' : `За обраний період доменів немає — спробуй ширше вікно`}
                   </span>
                 </div>
-              : <Table columns={columns} data={domains} selected={selected} onSelect={setSelected} />
+              : <>
+                  <Table columns={columns} data={domains} selected={selected} onSelect={setSelected} />
+                  <div ref={sentinelRef} style={{ display: 'flex', justifyContent: 'center', padding: 16 }}>
+                    {isFetchingNextPage ? <Spinner /> : !hasNextPage && (
+                      <span style={{ fontSize: 11, color: 'var(--text3)' }}>Це всі домени за обраний період</span>
+                    )}
+                  </div>
+                </>
           }
         </div>
       </div>
@@ -315,6 +422,15 @@ export default function DomainsPage() {
       {/* Right sidebar */}
       {isAdmin && (
         <div style={{ width: 244, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12, paddingTop: 52 }}>
+          <ActionCard
+            icon={<Plus size={16} />} accent="var(--accent)"
+            title="Швидке додавання"
+            desc="CF зона → CNAME, одним кліком, по списку доменів."
+            actions={[
+              { label: 'Відкрити форму', icon: <Plus size={13} />, onClick: () => setQuickAddModal(true), variant: 'primary' },
+            ]}
+          />
+
           <ActionCard
             icon={<Cloud size={16} />} accent="var(--accent)"
             title="Додати домени"
@@ -347,6 +463,12 @@ export default function DomainsPage() {
           <TeamStatsPanel />
         </div>
       )}
+
+      {/* Quick Add Modal */}
+      <QuickAddModal
+        open={quickAddModal} onClose={() => setQuickAddModal(false)}
+        onSuccess={() => { qc.invalidateQueries(['domains']); qc.invalidateQueries(['domains-count']) }}
+      />
 
       {/* NS Modal */}
       <NSModal open={nsModal} onClose={() => setNsModal(false)} domains={domains} selected={selected} />
@@ -456,6 +578,7 @@ function BulkDnsByNameModal({ open, onClose, onSuccess, defaultType = 'A' }) {
   useEffect(() => { if (open) setType(defaultType) }, [open, defaultType])
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState(null)
+  const [notFound, setNotFound] = useState([])
 
   async function submit() {
     setLoading(true)
@@ -463,6 +586,7 @@ function BulkDnsByNameModal({ open, onClose, onSuccess, defaultType = 'A' }) {
       const domains = domainsText.split('\n').map(d => d.trim()).filter(Boolean)
       const r = await bulkDnsByName({ domains, record_type: type, value, proxied: true })
       setResults(r.data.results || [])
+      setNotFound(r.data.not_found || [])
       onSuccess()
       if (r.data.warnings?.length) r.data.warnings.forEach(w => toast(w, { icon: <AlertTriangle size={16} style={{ color: 'var(--yellow)' }} /> }))
     } catch {
@@ -472,12 +596,43 @@ function BulkDnsByNameModal({ open, onClose, onSuccess, defaultType = 'A' }) {
     }
   }
 
-  function handleClose() { setResults(null); setDomainsText(''); setValue(''); onClose() }
+  function handleClose() { setResults(null); setNotFound([]); setDomainsText(''); setValue(''); onClose() }
+
+  const nsGroups = useMemo(() => groupByNS((results || []).filter(r => r.status === 'ok')), [results])
 
   return (
     <Modal open={open} onClose={handleClose} title="Масова зміна DNS — список доменів" width={560}>
       {results ? (
-        <ResultsList results={results.map(r => ({ domain: r.domain, status: r.status === 'ok' ? 'ok' : 'error', error: r.error }))} onClose={handleClose} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {notFound.length > 0 && (
+            <div style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: 8, padding: '10px 12px', fontSize: 12 }}>
+              <div style={{ fontWeight: 700, color: 'var(--yellow)', marginBottom: 4, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <AlertTriangle size={13} /> Не знайдено серед доданих у CF ({notFound.length})
+              </div>
+              <div style={{ fontFamily: 'var(--mono)', color: 'var(--text3)', wordBreak: 'break-all' }}>
+                {notFound.join(', ')}
+              </div>
+              <div style={{ marginTop: 4, color: 'var(--text3)' }}>
+                Зона ще не створена в CF — спочатку додай через «Додати домени».
+              </div>
+            </div>
+          )}
+          <div style={{ maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {results.map((r, i) => (
+              <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '4px 0', borderBottom: '1px solid var(--border)' }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {r.domain}
+                </span>
+                <Badge color={r.status === 'ok' ? 'green' : 'red'}>{r.status === 'ok' ? 'OK' : 'Помилка'}</Badge>
+                {r.status !== 'ok' && r.detail && (
+                  <span style={{ fontSize: 11, color: 'var(--red)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.detail}</span>
+                )}
+              </div>
+            ))}
+          </div>
+          <GroupedNSBlocks groups={nsGroups} />
+          <Btn onClick={handleClose} style={{ alignSelf: 'flex-end' }}>Закрити</Btn>
+        </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <Field label="Домени (по одному на рядок)">
@@ -877,6 +1032,188 @@ function NSModal({ open, onClose, domains, selected }) {
         <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
           <Btn variant="ghost" onClick={onClose}>Закрити</Btn>
         </div>
+      </div>
+    </Modal>
+  )
+}
+
+// ── Quick Add Modal (moved here from Dashboard) ────────────────────────────
+function QuickAddModal({ open, onClose, onSuccess }) {
+  const [teamId, setTeamId] = useState('')
+  const [cfAccountId, setCfAccountId] = useState('')
+  const [cnameValue, setCnameValue] = useState('')
+  const [text, setText] = useState('')
+  const [results, setResults] = useState(null)
+
+  const { data: teams = [] } = useQuery({
+    queryKey: ['teams'],
+    queryFn: () => getTeams().then(r => r.data),
+    enabled: open,
+  })
+  const { data: cfAccounts = [] } = useQuery({
+    queryKey: ['cf-accounts', teamId],
+    queryFn: () => getCFAccounts(teamId).then(r => r.data),
+    enabled: open && !!teamId,
+  })
+  // Source of CNAME suggestions: the team's tracker-agnostic CNAME targets
+  // (Settings → team → «CNAME цілі»), not tied to a live KT/Binom
+  // integration. Quick Add only sets the DNS record — it no longer
+  // registers the domain into a KT group (that's the "До Keitaro" flow).
+  const { data: cnameOptions = [] } = useQuery({
+    queryKey: ['cname-targets', teamId],
+    queryFn: () => getCnameTargets(teamId).then(r => r.data),
+    enabled: open && !!teamId,
+  })
+  const selectedTarget = cnameOptions.find(i => i.cname === cnameValue)
+
+  function handleTeamChange(id) {
+    setTeamId(id)
+    setCfAccountId('')
+    setCnameValue('')
+    setResults(null)
+  }
+
+  // After CF accounts load, auto-select the first one
+  useMemo(() => {
+    if (cfAccounts.length > 0 && !cfAccountId) {
+      const primary = [...cfAccounts].sort((a, b) => a.id - b.id)[0]
+      setCfAccountId(String(primary.id))
+    }
+  }, [cfAccounts])
+
+  const addMut = useMutation({
+    mutationFn: (payload) => quickAddDomains(payload).then(r => r.data),
+    onSuccess: (data) => {
+      setResults(data.results)
+      const added = data.results.filter(r => r.cf_status === 'added').length
+      const errors = data.results.filter(r => r.cf_status === 'error').length
+      if (added > 0) toast.success(`Додано ${added} доменів`)
+      if (errors > 0) toast.error(`${errors} помилок`)
+      onSuccess?.()
+    },
+    onError: (e) => toast.error(e.response?.data?.detail || 'Помилка'),
+  })
+
+  const domainLines = text.split('\n').map(s => s.trim()).filter(Boolean)
+
+  function submit() {
+    if (!cfAccountId || domainLines.length === 0) return
+    addMut.mutate({
+      domains: domainLines,
+      cf_account_id: parseInt(cfAccountId),
+      cname: cnameValue || null,
+    })
+  }
+
+  // CF assigns NS per zone — group instead of repeating per domain.
+  const nsGroups = useMemo(
+    () => groupByNS((results || []).filter(r => r.cf_status === 'added')),
+    [results]
+  )
+
+  function handleClose() {
+    setResults(null); setText(''); setTeamId(''); setCfAccountId(''); setCnameValue('')
+    onClose()
+  }
+
+  return (
+    <Modal open={open} onClose={handleClose} title="Швидке додавання доменів" width={640}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <p style={{ fontSize: 12, color: 'var(--text3)', margin: 0 }}>CF зона → CNAME — одним кліком. NS Cloudflare призначає сам.</p>
+
+        <Field label="Команда">
+          <select value={teamId} onChange={e => handleTeamChange(e.target.value)}>
+            <option value="">Оберіть команду...</option>
+            {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </Field>
+
+        <Field label="Cloudflare акаунт (основний)">
+          <select value={cfAccountId} onChange={e => setCfAccountId(e.target.value)} disabled={!teamId}>
+            <option value="">Оберіть акаунт...</option>
+            {[...cfAccounts].sort((a, b) => a.id - b.id).map((a, i) => (
+              <option key={a.id} value={a.id}>{a.name}{i === 0 ? ' (основний)' : ''}</option>
+            ))}
+          </select>
+        </Field>
+
+        <Field label="CNAME (необов'язково)">
+          <select value={cnameValue} onChange={e => setCnameValue(e.target.value)} disabled={!teamId}>
+            <option value="">Без CNAME</option>
+            {cnameOptions.map(t => <option key={t.id} value={t.cname}>{t.description || t.cname} → {t.cname}</option>)}
+          </select>
+        </Field>
+
+        {selectedTarget && (
+          <div style={{ background: 'var(--accent-dim)', border: '1px solid rgba(79,110,247,0.25)', borderRadius: 6, padding: '8px 12px', fontSize: 12 }}>
+            CNAME буде направлено на: <strong style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>{selectedTarget.cname}</strong>
+            {selectedTarget.description && <>{' '}(<span style={{ color: 'var(--text2)' }}>{selectedTarget.description}</span>)</>}
+          </div>
+        )}
+        {teamId && cnameOptions.length === 0 && (
+          <div style={{ fontSize: 11, color: 'var(--text3)', padding: '4px 0', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Info size={11} /> У команди немає CNAME цілей — додай в Налаштуваннях команди, або залиши без CNAME
+          </div>
+        )}
+
+        <Field label={`Домени (${domainLines.length}) — по одному на рядок`}>
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            rows={8}
+            placeholder={'example.com\ndomain2.net\nmydomain.org'}
+            style={{ resize: 'vertical', fontFamily: 'var(--mono)', fontSize: 12 }}
+          />
+        </Field>
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <Btn variant="ghost" onClick={handleClose}>Закрити</Btn>
+          <Btn
+            loading={addMut.isPending}
+            disabled={!cfAccountId || domainLines.length === 0}
+            onClick={submit}
+          >
+            <Plus size={14} /> Додати {domainLines.length > 0 ? `(${domainLines.length})` : ''}
+          </Btn>
+        </div>
+
+        {/* Results */}
+        {results && (
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>
+              Результат: {results.filter(r => r.cf_status === 'added').length} додано /&nbsp;
+              {results.filter(r => r.cf_status === 'exists').length} вже є /&nbsp;
+              {results.filter(r => r.cf_status === 'error').length} помилок
+            </span>
+            <div style={{ overflowX: 'auto', maxHeight: 200, overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'var(--mono)', fontSize: 12 }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    {['Домен', 'CF', 'CNAME'].map(h => (
+                      <th key={h} style={{ padding: '6px 10px', textAlign: 'left', color: 'var(--text3)', fontWeight: 600 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map(r => (
+                    <tr key={r.domain} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '6px 10px', fontWeight: 600 }}>{r.domain}</td>
+                      <td style={{ padding: '6px 10px' }}>
+                        {r.cf_status === 'added'  && <Badge color="green">Додано</Badge>}
+                        {r.cf_status === 'exists' && <Badge color="default">Існує</Badge>}
+                        {r.cf_status === 'error'  && <Badge color="red" title={r.cf_error}>Помилка</Badge>}
+                      </td>
+                      <td style={{ padding: '6px 10px' }}>
+                        {r.cname_set ? <Badge color="green">✓</Badge> : <span style={{ color: 'var(--text3)' }}>—</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <GroupedNSBlocks groups={nsGroups} />
+          </div>
+        )}
       </div>
     </Modal>
   )

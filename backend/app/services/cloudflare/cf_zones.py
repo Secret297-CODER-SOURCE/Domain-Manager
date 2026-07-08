@@ -11,6 +11,14 @@ CF_API = "https://api.cloudflare.com/client/v4"
 TIMEOUT = 30
 
 
+class CFAuthError(Exception):
+    """Cloudflare rejected the credentials outright (401/403) — the token is
+    actually invalid/revoked. Distinct from transient failures (rate limits,
+    timeouts, 5xx) so callers can tell "this account is dead" apart from
+    "try again later" instead of treating every hiccup as a dead token."""
+    pass
+
+
 def detect_auth_type(api_key: str) -> str:
     """Returns 'token' or 'global'"""
     # cfk_ keys use X-Auth-Key + X-Auth-Email (NOT Bearer)
@@ -91,7 +99,9 @@ async def fetch_zones(email: Optional[str], api_key: str) -> list[dict]:
             )
             data = r.json()
             if not data.get("success"):
-                raise Exception(f"CF API error: {data.get('errors')}")
+                if r.status_code in (401, 403):
+                    raise CFAuthError(f"CF auth error ({r.status_code}): {data.get('errors')}")
+                raise Exception(f"CF API error ({r.status_code}): {data.get('errors')}")
             zones.extend(data.get("result", []))
             info = data.get("result_info", {})
             if page >= info.get("total_pages", 1):

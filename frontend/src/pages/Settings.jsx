@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import toast from 'react-hot-toast'
-import { Plus, Trash2, RefreshCw, ChevronDown, ChevronRight, Check, X, Pencil, BarChart2, Cloud, Lock, ExternalLink } from 'lucide-react'
+import { Plus, Trash2, RefreshCw, ChevronDown, ChevronRight, Check, X, Pencil, BarChart2, Cloud, Lock, ExternalLink, ArrowRight } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import {
   getTeams, createTeam, updateTeam, deleteTeam,
   getKTInstances, createKTInstance, deleteKTInstance, syncKTGroups, updateKTInstance,
+  getCnameTargets, createCnameTarget, updateCnameTarget, deleteCnameTarget,
   getFrontendCodeword, setFrontendCodeword,
 } from '../api/client'
 import { Btn, Modal, Spinner, Field, Badge } from '../components/ui/index'
@@ -134,6 +135,25 @@ function TeamCard({ team, expanded, onToggle, onDelete, onAddKT, onEditKT }) {
     onError: () => toast.error('Помилка оновлення'),
   })
 
+  const { data: cnameTargets = [] } = useQuery({
+    queryKey: ['cname-targets', team.id], enabled: expanded,
+    queryFn: () => getCnameTargets(team.id).then(r => r.data),
+  })
+  const addCname = useMutation({
+    mutationFn: (data) => createCnameTarget(team.id, data),
+    onSuccess: () => qc.invalidateQueries(['cname-targets', team.id]),
+    onError: () => toast.error('Помилка додавання'),
+  })
+  const updateCname = useMutation({
+    mutationFn: ({ id, ...data }) => updateCnameTarget(team.id, id, data),
+    onSuccess: () => qc.invalidateQueries(['cname-targets', team.id]),
+    onError: () => toast.error('Помилка оновлення'),
+  })
+  const delCname = useMutation({
+    mutationFn: (id) => deleteCnameTarget(team.id, id),
+    onSuccess: () => qc.invalidateQueries(['cname-targets', team.id]),
+  })
+
   return (
     <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
       <div
@@ -195,6 +215,27 @@ function TeamCard({ team, expanded, onToggle, onDelete, onAddKT, onEditKT }) {
             ))}
             {ktInstances.length === 0 && <p style={{ color: 'var(--text3)', fontSize: 12 }}>Немає інстансів</p>}
           </div>
+
+          <div style={{ marginTop: 18, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+            <div style={{ marginBottom: 10 }}>
+              <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text3)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <ArrowRight size={12} /> CNAME цілі ({cnameTargets.length})
+              </span>
+              <p style={{ fontSize: 11, color: 'var(--text3)', margin: '4px 0 0' }}>
+                Куди спрямовувати CNAME у Швидкому додаванні — без прив'язки до конкретного трекера (KT, Binom, будь-що).
+              </p>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {cnameTargets.map(t => (
+                <CnameTargetRow key={t.id} target={t}
+                  onSave={(data) => updateCname.mutate({ id: t.id, ...data })}
+                  onDelete={() => gateDelete(() => delCname.mutateAsync(t.id)).catch(() => {})}
+                />
+              ))}
+              {cnameTargets.length === 0 && <p style={{ color: 'var(--text3)', fontSize: 12 }}>Ще немає CNAME цілей</p>}
+            </div>
+            <AddCnameTargetForm loading={addCname.isPending} onAdd={(data) => addCname.mutate(data)} />
+          </div>
         </div>
       )}
     </div>
@@ -255,6 +296,77 @@ function KTInstanceRow({ kt, onSync, syncLoading, onDelete, onSaveCname, onEdit 
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+function CnameTargetRow({ target, onSave, onDelete }) {
+  const [editing, setEditing] = useState(false)
+  const [cname, setCname] = useState(target.cname)
+  const [description, setDescription] = useState(target.description || '')
+
+  function save() {
+    if (!cname.trim()) return
+    onSave({ cname: cname.trim(), description: description.trim() || null })
+    setEditing(false)
+  }
+  function cancel() {
+    setCname(target.cname); setDescription(target.description || ''); setEditing(false)
+  }
+
+  return (
+    <div style={{
+      background: 'var(--bg3)', borderRadius: 6, padding: '8px 12px',
+      border: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10,
+    }}>
+      {editing ? (
+        <>
+          <input value={description} onChange={e => setDescription(e.target.value)}
+            placeholder="Опис (куди направляє)" style={{ flex: 1, fontSize: 12, padding: '3px 8px' }}
+            onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }} autoFocus />
+          <ArrowRight size={12} color="var(--text3)" />
+          <input value={cname} onChange={e => setCname(e.target.value)}
+            placeholder="cname.example.com" style={{ flex: 1, fontSize: 12, fontFamily: 'var(--mono)', padding: '3px 8px' }}
+            onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }} />
+          <Btn size="sm" variant="ghost" onClick={save}><Check size={11} /></Btn>
+          <Btn size="sm" variant="ghost" onClick={cancel}><X size={11} /></Btn>
+        </>
+      ) : (
+        <>
+          <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => setEditing(true)} title="Клікни щоб редагувати">
+            <span style={{ fontSize: 12, color: target.description ? 'var(--text)' : 'var(--text3)' }}>
+              {target.description || '— без опису —'}
+            </span>
+            <span style={{ margin: '0 6px', color: 'var(--text3)' }}>→</span>
+            <span style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--accent)' }}>{target.cname}</span>
+          </div>
+          <Btn size="sm" variant="ghost" onClick={() => setEditing(true)} title="Редагувати"><Pencil size={11} /></Btn>
+          <Btn size="sm" variant="danger" onClick={onDelete}><Trash2 size={11} /></Btn>
+        </>
+      )}
+    </div>
+  )
+}
+
+function AddCnameTargetForm({ onAdd, loading }) {
+  const [description, setDescription] = useState('')
+  const [cname, setCname] = useState('')
+
+  function submit() {
+    if (!cname.trim()) return
+    onAdd({ cname: cname.trim(), description: description.trim() || null })
+    setDescription(''); setCname('')
+  }
+
+  return (
+    <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+      <input value={description} onChange={e => setDescription(e.target.value)}
+        placeholder="Опис (напр. Binom кампанія X)" style={{ flex: 1, fontSize: 12 }}
+        onKeyDown={e => { if (e.key === 'Enter') submit() }} />
+      <input value={cname} onChange={e => setCname(e.target.value)}
+        placeholder="cname.example.com" style={{ flex: 1, fontSize: 12, fontFamily: 'var(--mono)' }}
+        onKeyDown={e => { if (e.key === 'Enter') submit() }} />
+      <Btn size="sm" loading={loading} disabled={!cname.trim()} onClick={submit}><Plus size={12} /> Додати</Btn>
     </div>
   )
 }

@@ -27,6 +27,7 @@ import CloudflarePage from './pages/Cloudflare'
 import CheckPage from './pages/Check'
 import NotesPage from './pages/Notes'
 import ServersPage from './pages/Servers'
+import PaymentsPage from './pages/Payments'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
@@ -73,6 +74,7 @@ export default function App() {
               <Route path="services"   element={<ServicesPage />} />
               <Route path="cloudflare" element={<CloudflarePage />} />
               <Route path="servers"    element={<ServersPage />} />
+              <Route path="payments"   element={<PaymentsPage />} />
               <Route path="notes"      element={<NotesPage />} />
               <Route path="passwords" element={<RequireAdmin><PasswordsPage /></RequireAdmin>} />
               <Route path="backup"    element={<RequireAdmin><BackupPage /></RequireAdmin>} />

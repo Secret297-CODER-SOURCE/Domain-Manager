@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox, StickyNote, Server, Cloud } from 'lucide-react'
+import { Globe, Settings, Users, LogOut, Database, Search, BarChart2, Home, ScrollText, FileSpreadsheet, ShieldCheck, Network, Archive, ShoppingBag, Activity, Sparkles, Inbox, StickyNote, Server, Cloud, Wallet } from 'lucide-react'
 import { useAuthStore } from '../../store/auth'
 import toast from 'react-hot-toast'
 import NotificationBell from '../NotificationBell'
@@ -27,6 +27,7 @@ export default function Layout() {
     { to: '/identities', icon: Sparkles,       label: 'Особистості' },
     { to: '/mail',       icon: Inbox,          label: 'Пошта' },
     { to: '/servers',    icon: Server,         label: 'Сервери' },
+    { to: '/payments',   icon: Wallet,         label: 'Оплати' },
     { to: '/services',   icon: Globe,          label: 'Сервіси' },
     { to: '/cloudflare', icon: Cloud,          label: 'Cloudflare' },
     { to: '/notes',      icon: StickyNote,     label: 'Нотатки' },

@@ -7,7 +7,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api, notifications as notifications_api
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api, notifications as notifications_api, payments as payments_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -221,6 +221,84 @@ async def server_payment_reminder_job():
     logger.info(f"[server_payment] sent: {total} servers across {len(by_team)} teams")
 
 
+async def payment_due_reminder_job():
+    """Daily — warn about recurring payments (licenses, KLO, servers, AI
+    subscriptions, VDS) due within 5 days, so nothing lapses silently.
+
+    De-dup: keeps a 20h window via ActionLog `payment_due_reminded`, keyed
+    by payment label, so a cron that fires more than once a day doesn't
+    double-blast. Overdue items (days_left < 0) keep re-notifying daily
+    until someone marks them paid — that's intentional.
+    """
+    from sqlalchemy import select, text as _text
+    from app.models.models import RecurringPayment, Team, ActionLog
+    from app.services.telegram_bot import notify_admins
+    from app.services.audit import log_action
+    from datetime import timezone as _tz
+
+    WARN_DAYS = 5
+    CATEGORY_LABELS = {
+        "license": "Ліцензії", "klo": "КЛО", "server": "Сервери",
+        "ai": "Підписки AI", "vds": "ВДС", "other": "Інше",
+    }
+
+    async with AsyncSessionLocal() as db:
+        q = (
+            select(RecurringPayment, Team)
+            .outerjoin(Team, RecurringPayment.team_id == Team.id)
+            .where(
+                RecurringPayment.next_due_at.isnot(None),
+                RecurringPayment.next_due_at < _text(f"NOW() + INTERVAL '{WARN_DAYS} days'"),
+            )
+        )
+        rows = (await db.execute(q)).all()
+        if not rows:
+            logger.info("[payment_due] nothing due soon")
+            return
+
+        notified = {
+            r.domain for r in (await db.execute(
+                select(ActionLog).where(
+                    ActionLog.action == "payment_due_reminded",
+                    ActionLog.created_at > _text("NOW() - INTERVAL '20 hours'"),
+                )
+            )).scalars().all()
+        }
+        fresh = [(p, t) for p, t in rows if p.label not in notified]
+        if not fresh:
+            logger.info("[payment_due] all due payments already notified today")
+            return
+
+        now = datetime.now(_tz.utc)
+        by_category: dict[str, list] = {}
+        for p, t in fresh:
+            days_left = (p.next_due_at - now).days
+            by_category.setdefault(p.category, []).append({
+                "label": p.label, "provider": p.provider or "—",
+                "team": t.name if t else "—", "days_left": days_left,
+            })
+            log_action(db, "payment_due_reminded", user="system", target=p.label,
+                       details={"category": p.category, "days_left": days_left,
+                                "provider": p.provider, "team": t.name if t else None})
+        await db.commit()
+
+    total = sum(len(v) for v in by_category.values())
+    lines = [f"<b>[NAGADUVANNYA] Оплати, які треба зробити (≤{WARN_DAYS}д) · всього {total}</b>\n"]
+    for cat, items in sorted(by_category.items(), key=lambda x: -len(x[1])):
+        cat_label = CATEGORY_LABELS.get(cat, cat)
+        lines.append(f"<b>{cat_label}</b> ({len(items)}):")
+        for it in sorted(items, key=lambda x: x["days_left"]):
+            d_left = it["days_left"]
+            if d_left < 0: marker = f"<b>ПРОСТРОЧЕНО {-d_left}д</b>"
+            elif d_left == 0: marker = "<b>СЬОГОДНІ</b>"
+            elif d_left == 1: marker = "<b>завтра</b>"
+            else: marker = f"за {d_left}д"
+            lines.append(f"  • <code>{it['label']}</code> — {marker} · {it['provider']} · {it['team']}")
+        lines.append("")
+    await notify_admins("\n".join(lines))
+    logger.info(f"[payment_due] sent: {total} payments across {len(by_category)} categories")
+
+
 async def daily_stats_report():
     """Send daily domain stats per team to TG admins."""
     from app.services.telegram_bot import notify_admins
@@ -330,9 +408,13 @@ async def lifespan(app: FastAPI):
     # 4 days of each month; falls through harmlessly the rest of the time.
     scheduler.add_job(server_payment_reminder_job, "cron", hour=8, minute=30,
                       id="server_payment_reminder")
+    # Daily recurring-payments reminder at 06:00 UTC (09:00 Kyiv) — warn 5
+    # days before any license/KLO/server/AI-subscription/VDS payment is due.
+    scheduler.add_job(payment_due_reminder_job, "cron", hour=6, minute=0,
+                      id="payment_due_reminder")
 
     scheduler.start()
-    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, server_payment@08:30, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, server_payment@08:30, payment_due@06:00, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:
@@ -400,6 +482,7 @@ app.include_router(sheet_import.router)
 app.include_router(dynadot_api.router)
 app.include_router(public_api.router)
 app.include_router(notifications_api.router)
+app.include_router(payments_api.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

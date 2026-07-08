@@ -9,7 +9,7 @@ import asyncio
 import logging
 
 from app.db.session import AsyncSessionLocal
-from app.models.models import Team, CloudflareAccount, KeitaroInstance, Purchase, User
+from app.models.models import Team, CloudflareAccount, KeitaroInstance, CnameTarget, Purchase, User
 from app.core.security import require_admin, get_current_user, require_delete_token
 from app.services.cloudflare.cf_zones import verify_account
 from app.services.audit import log_action
@@ -127,6 +127,22 @@ class KTInstanceOut(BaseModel):
     url: str
     cname: Optional[str]
     is_active: bool
+    class Config:
+        from_attributes = True
+
+class CnameTargetCreate(BaseModel):
+    cname: str
+    description: Optional[str] = None
+
+class CnameTargetUpdate(BaseModel):
+    cname: Optional[str] = None
+    description: Optional[str] = None
+
+class CnameTargetOut(BaseModel):
+    id: int
+    team_id: int
+    cname: str
+    description: Optional[str]
     class Config:
         from_attributes = True
 
@@ -487,4 +503,49 @@ async def delete_kt_instance(team_id: int, instance_id: int, db: AsyncSession = 
     if not inst:
         raise HTTPException(404, "Instance not found")
     await db.delete(inst)
+    return {"ok": True}
+
+
+# ── CNAME targets (tracker-agnostic — KT, Binom, whatever) ────────────────
+
+@router.get("/{team_id}/cname-targets", response_model=list[CnameTargetOut])
+async def list_cname_targets(team_id: int, db: AsyncSession = Depends(get_db), _=Depends(get_current_user)):
+    result = await db.execute(
+        select(CnameTarget).where(CnameTarget.team_id == team_id).order_by(CnameTarget.id)
+    )
+    return result.scalars().all()
+
+@router.post("/{team_id}/cname-targets", response_model=CnameTargetOut, dependencies=[Depends(require_admin)])
+async def add_cname_target(team_id: int, data: CnameTargetCreate, db: AsyncSession = Depends(get_db)):
+    team = await db.get(Team, team_id)
+    if not team:
+        raise HTTPException(404, "Team not found")
+    target = CnameTarget(team_id=team_id, cname=data.cname.strip(), description=(data.description or "").strip() or None)
+    db.add(target)
+    await db.flush()
+    await db.refresh(target)
+    return target
+
+@router.patch("/{team_id}/cname-targets/{target_id}", response_model=CnameTargetOut, dependencies=[Depends(require_admin)])
+async def update_cname_target(team_id: int, target_id: int, data: CnameTargetUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(CnameTarget).where(CnameTarget.id == target_id, CnameTarget.team_id == team_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "CNAME target not found")
+    if data.cname is not None and data.cname.strip():
+        target.cname = data.cname.strip()
+    if data.description is not None:
+        target.description = data.description.strip() or None
+    await db.flush()
+    await db.refresh(target)
+    await db.commit()
+    return target
+
+@router.delete("/{team_id}/cname-targets/{target_id}", dependencies=[Depends(require_delete_token)])
+async def delete_cname_target(team_id: int, target_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(CnameTarget).where(CnameTarget.id == target_id, CnameTarget.team_id == team_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "CNAME target not found")
+    await db.delete(target)
     return {"ok": True}

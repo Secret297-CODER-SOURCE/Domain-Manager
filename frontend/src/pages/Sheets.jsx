@@ -7,7 +7,7 @@ import {
   Plus, Trash2, Download, Upload, FileSpreadsheet, Save,
   Lock, Unlock, X, LayoutGrid, Globe, ExternalLink, RefreshCw, Link2,
   Server, Mail as MailIcon, FileText, ChevronRight, ChevronDown, ArrowLeft, ArrowRight,
-  Check, AlertTriangle, RotateCw, XCircle, CheckCircle2, Sparkles, KeyRound,
+  Check, AlertTriangle, RotateCw, XCircle, CheckCircle2, Sparkles, KeyRound, Wallet,
 } from 'lucide-react'
 import { saveAs } from 'file-saver'
 import * as XLSX from 'xlsx'
@@ -1403,6 +1403,7 @@ function BatchImportPanel({ url, sheetName, onClose }) {
             include: initialTarget !== 'notes' && !t.error,
             target: initialTarget,
             column_map: t.guess?.[initialTarget] || {},
+            category: guessPaymentCategory(t.name),
           }
         }
         setConfig(init)
@@ -1435,8 +1436,9 @@ function BatchImportPanel({ url, sheetName, onClose }) {
     const next = { ...config }
     for (const t of data.tabs) {
       if (t.error) continue
-      const matches = target === 'servers' ? t.can_servers
-                   : target === 'mail'    ? t.can_mail
+      const matches = target === 'servers'  ? t.can_servers
+                   : target === 'mail'      ? t.can_mail
+                   : target === 'payments'  ? t.can_payments
                    : true
       if (matches) next[t.gid] = { ...next[t.gid], include: true, target, column_map: t.guess?.[target] || next[t.gid]?.column_map || {} }
     }
@@ -1454,17 +1456,18 @@ function BatchImportPanel({ url, sheetName, onClose }) {
 
   // Predicted creation counts across all selected tabs
   const predicted = useMemo(() => {
-    if (!data) return { servers: 0, mail: 0, notes: 0 }
-    let s = 0, m = 0, n = 0
+    if (!data) return { servers: 0, mail: 0, notes: 0, payments: 0 }
+    let s = 0, m = 0, n = 0, p = 0
     for (const t of data.tabs) {
       const c = config[t.gid]
       if (!c?.include || t.error) continue
       if (c.target === 'servers')      s += t.total_rows
       else if (c.target === 'mail')    m += t.total_rows
+      else if (c.target === 'payments') p += t.total_rows
       else if (c.target === 'notes')   n += 1
       else if (c.target === 'auto')   { s += t.route_counts?.servers || 0; m += t.route_counts?.mail || 0 }
     }
-    return { servers: s, mail: m, notes: n }
+    return { servers: s, mail: m, notes: n, payments: p }
   }, [data, config])
 
   const visibleTabs = useMemo(() => {
@@ -1481,6 +1484,7 @@ function BatchImportPanel({ url, sheetName, onClose }) {
         target: config[t.gid].target,
         column_map: config[t.gid].column_map,
         tab_name: t.name,
+        category: config[t.gid].target === 'payments' ? (config[t.gid].category || 'other') : undefined,
       }))
     if (!items.length) { toast.error('Не обрано жодного аркуша'); return }
     setRunning(true); setStage('running')
@@ -1557,6 +1561,9 @@ function BatchImportPanel({ url, sheetName, onClose }) {
             <button onClick={() => selectByTarget('mail')} style={pillBtnStyle} title="Обрати вкладки придатні для пошти">
               <MailIcon size={10} /> Пошта
             </button>
+            <button onClick={() => selectByTarget('payments')} style={pillBtnStyle} title="Обрати вкладки придатні для оплат">
+              <Wallet size={10} /> Оплати
+            </button>
             <button onClick={() => toggleAll(true)} style={pillBtnStyle}><Check size={10} /> Усе</button>
             <button onClick={() => toggleAll(false)} style={pillBtnStyle}><X size={10} /> Зняти</button>
           </div>
@@ -1576,13 +1583,14 @@ function BatchImportPanel({ url, sheetName, onClose }) {
                 onSetTarget={(v) => setTarget(t.gid, v)}
                 onExpand={() => setExpanded(expanded === t.gid ? null : t.gid)}
                 onMapChange={(field, header) => patch(t.gid, { column_map: { ...config[t.gid].column_map, [field]: header } })}
+                onCategoryChange={(category) => patch(t.gid, { category })}
               />
             ))}
           </div>
 
           {/* Footer — predicted creation summary + actions */}
           <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', background: 'var(--bg2)', display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {(predicted.servers > 0 || predicted.mail > 0 || predicted.notes > 0) && (
+            {(predicted.servers > 0 || predicted.mail > 0 || predicted.notes > 0 || predicted.payments > 0) && (
               <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text2)', alignItems: 'center', flexWrap: 'wrap' }}>
                 <span style={{ color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', fontSize: 10 }}>буде створено:</span>
                 {predicted.servers > 0 && (
@@ -1593,6 +1601,11 @@ function BatchImportPanel({ url, sheetName, onClose }) {
                 {predicted.mail > 0 && (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#4ade80' }}>
                     <MailIcon size={12} /> <b>{predicted.mail}</b> пошт{predicted.mail === 1 ? 'а' : 'и'}
+                  </span>
+                )}
+                {predicted.payments > 0 && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#f59e0b' }}>
+                    <Wallet size={12} /> <b>{predicted.payments}</b> оплат{predicted.payments === 1 ? 'а' : ''}
                   </span>
                 )}
                 {predicted.notes > 0 && (
@@ -1702,11 +1715,33 @@ function NiceCheckbox({ checked, disabled, onChange, size = 16 }) {
 }
 
 const TARGET_OPTIONS = [
-  { v: 'auto',    label: 'Авто-розділення', icon: Sparkles, needs: 'can_auto' },
-  { v: 'servers', label: 'Сервери',         icon: Server,   needs: 'can_servers' },
-  { v: 'mail',    label: 'Пошта',           icon: MailIcon, needs: 'can_mail' },
-  { v: 'notes',   label: 'Нотатка',         icon: FileText, needs: null },
+  { v: 'auto',     label: 'Авто-розділення', icon: Sparkles, needs: 'can_auto' },
+  { v: 'servers',  label: 'Сервери',         icon: Server,   needs: 'can_servers' },
+  { v: 'mail',     label: 'Пошта',           icon: MailIcon, needs: 'can_mail' },
+  { v: 'payments', label: 'Оплати',          icon: Wallet,   needs: 'can_payments' },
+  { v: 'notes',    label: 'Нотатка',         icon: FileText, needs: null },
 ]
+
+const PAYMENT_CATEGORIES = [
+  { v: 'license', label: 'Ліцензії' },
+  { v: 'klo',      label: 'КЛО' },
+  { v: 'server',   label: 'Сервери' },
+  { v: 'ai',       label: 'Підписки AI' },
+  { v: 'vds',      label: 'ВДС' },
+  { v: 'other',    label: 'Інше' },
+]
+
+// Best-effort default category from the tab name — just a starting point,
+// the admin picks the real one in the dropdown before importing.
+function guessPaymentCategory(name) {
+  const lc = (name || '').toLowerCase()
+  if (/ліценз|лицен/.test(lc)) return 'license'
+  if (/вдс|vds/.test(lc)) return 'vds'
+  if (/vps|server|сервер/.test(lc)) return 'server'
+  if (/ai\b|штучн/.test(lc)) return 'ai'
+  if (/кло/.test(lc)) return 'klo'
+  return 'other'
+}
 
 const COL_TYPE_BADGES = {
   email:    { label: 'email',    color: '#4ade80' },
@@ -1731,7 +1766,7 @@ function ColTypeBadge({ type }) {
   )
 }
 
-function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, onMapChange }) {
+function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, onMapChange, onCategoryChange }) {
   if (!cfg) return null
   const disabled = !!tab.error
   const TargetIcon = TARGET_OPTIONS.find(o => o.v === cfg.target)?.icon || FileText
@@ -1741,7 +1776,9 @@ function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, 
     ? ['host', 'label', 'username', 'password', 'web_url', 'tags', 'notes']
     : cfg.target === 'mail'
       ? ['email', 'password', 'label', 'tags', 'notes']
-      : []
+      : cfg.target === 'payments'
+        ? ['label', 'provider', 'login', 'password', 'next_due_at', 'notes']
+        : []
 
   return (
     <div style={{
@@ -1809,9 +1846,11 @@ function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, 
             padding: '3px 6px', borderRadius: 4,
             background: cfg.target === 'servers' ? 'rgba(125,163,255,0.15)'
               : cfg.target === 'mail' ? 'rgba(74,222,128,0.15)'
+              : cfg.target === 'payments' ? 'rgba(245,158,11,0.15)'
               : 'var(--bg)',
             color: cfg.target === 'servers' ? '#7da3ff'
               : cfg.target === 'mail' ? '#4ade80'
+              : cfg.target === 'payments' ? '#f59e0b'
               : 'var(--text3)',
             fontSize: 10, fontWeight: 600, flexShrink: 0,
           }}>
@@ -1845,9 +1884,10 @@ function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, 
                 const sel = cfg.target === o.v
                 const Ic = o.icon
                 const tipMap = {
-                  auto:    'Не виявлено рядків з email чи host',
-                  servers: 'Не знайдено колонку host/ip',
-                  mail:    'Не знайдено колонку email',
+                  auto:     'Не виявлено рядків з email чи host',
+                  servers:  'Не знайдено колонку host/ip',
+                  mail:     'Не знайдено колонку email',
+                  payments: 'Не знайдено колонку з назвою',
                 }
                 return (
                   <button key={o.v} disabled={!ok} onClick={() => onSetTarget(o.v)}
@@ -1867,6 +1907,20 @@ function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, 
               })}
             </div>
           </div>
+
+          {/* Payments — which category these rows become */}
+          {cfg.target === 'payments' && (
+            <div>
+              <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4 }}>Категорія оплат</div>
+              <select value={cfg.category || 'other'} onChange={e => onCategoryChange(e.target.value)}
+                style={{
+                  width: '100%', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+                  padding: '5px 8px', color: 'var(--text)', fontSize: 11,
+                }}>
+                {PAYMENT_CATEGORIES.map(c => <option key={c.v} value={c.v}>{c.label}</option>)}
+              </select>
+            </div>
+          )}
 
           {/* Auto mode — summary of what will be split */}
           {cfg.target === 'auto' && tab.route_counts && (
@@ -1902,7 +1956,7 @@ function CompactTabRow({ tab, cfg, isExpanded, onToggle, onSetTarget, onExpand, 
               <div style={{ fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4 }}>Маппінг колонок</div>
               <div style={{ display: 'grid', gridTemplateColumns: '110px 1fr', gap: 4, fontSize: 11 }}>
                 {fields.map(field => {
-                  const required = (cfg.target === 'servers' && field === 'host') || (cfg.target === 'mail' && field === 'email')
+                  const required = (cfg.target === 'servers' && field === 'host') || (cfg.target === 'mail' && field === 'email') || (cfg.target === 'payments' && field === 'label')
                   const filled = !!cfg.column_map[field]
                   return (
                     <div key={field} style={{ display: 'contents' }}>

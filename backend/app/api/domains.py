@@ -43,6 +43,7 @@ class DomainOut(BaseModel):
     name_servers: Optional[str] = None
     added_by_user_id: Optional[int] = None
     added_by_username: Optional[str] = None
+    abuse_count: int = 0
     class Config:
         from_attributes = True
 
@@ -85,24 +86,72 @@ class LogOut(BaseModel):
         from_attributes = True
 
 
+class DomainFilters:
+    """Shared query params for listing/counting domains — kept as one
+    dependency so the filtered count always matches the filtered list."""
+    def __init__(
+        self,
+        team_id: Optional[str] = Query(None),
+        cf_account_id: Optional[str] = Query(None),
+        status: Optional[str] = Query(None),
+        zone: Optional[str] = Query(None),
+        search: Optional[str] = Query(None),
+        keitaro_group_id: Optional[str] = Query(None),
+        keitaro_instance_id: Optional[str] = Query(None),
+        no_keitaro: Optional[str] = Query(None),
+        cname_value: Optional[str] = Query(None),
+        direct_to_kt: Optional[str] = Query(None),
+    ):
+        self.team_id = team_id
+        self.cf_account_id = cf_account_id
+        self.status = status
+        self.zone = zone
+        self.search = search
+        self.keitaro_group_id = keitaro_group_id
+        self.keitaro_instance_id = keitaro_instance_id
+        self.no_keitaro = no_keitaro
+        self.cname_value = cname_value
+        self.direct_to_kt = direct_to_kt
+
+    def build(self) -> list:
+        filters = []
+        if self.team_id and self.team_id.strip():
+            filters.append(Team.id == int(self.team_id))
+        if self.cf_account_id and self.cf_account_id.strip():
+            filters.append(CloudflareAccount.id == int(self.cf_account_id))
+        if self.status and self.status.strip():
+            filters.append(Domain.zone_status == DomainStatus(self.status))
+        if self.zone and self.zone.strip():
+            filters.append(Domain.name.like(f"%{self.zone}"))
+        if self.search and self.search.strip():
+            filters.append(Domain.name.ilike(f"%{self.search}%"))
+        if self.keitaro_group_id and self.keitaro_group_id.strip():
+            filters.append(Domain.keitaro_group_id == int(self.keitaro_group_id))
+        if self.keitaro_instance_id and self.keitaro_instance_id.strip():
+            filters.append(KeitaroInstance.id == int(self.keitaro_instance_id))
+        if self.no_keitaro and self.no_keitaro not in ("false", "0", ""):
+            filters.append(Domain.keitaro_group_id.is_(None))
+        if self.cname_value and self.cname_value.strip():
+            filters.append(Domain.main_record_value.ilike(f"%{self.cname_value}%"))
+        if self.direct_to_kt and self.direct_to_kt not in ("false", "0", ""):
+            filters.append(Domain.direct_to_keitaro == True)
+        return filters
+
+
 @router.get("", response_model=list[DomainOut])
 async def list_domains(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_user),
-    team_id: Optional[str] = Query(None),
-    cf_account_id: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    zone: Optional[str] = Query(None),
-    search: Optional[str] = Query(None),
-    keitaro_group_id: Optional[str] = Query(None),
-    keitaro_instance_id: Optional[str] = Query(None),
-    no_keitaro: Optional[str] = Query(None),
-    cname_value: Optional[str] = Query(None),
-    direct_to_kt: Optional[str] = Query(None),
+    f: DomainFilters = Depends(),
     page: int = Query(1, ge=1),
-    page_size: int = Query(100000, ge=1),
+    page_size: int = Query(50, ge=1, le=2000),
+    # Recency window in days — 0/None means no cutoff. Ignored when `search`
+    # is set: looking up a specific domain by name shouldn't hide it just
+    # because it's older than the window.
+    days: Optional[int] = Query(7, ge=0),
 ):
     from app.models.models import User as _User
+    from sqlalchemy import text as _text
     q = (
         select(Domain, CloudflareAccount, Team,
                KeitaroDomainGroup, KeitaroInstance, _User)
@@ -112,34 +161,30 @@ async def list_domains(
         .outerjoin(KeitaroInstance, KeitaroDomainGroup.keitaro_instance_id == KeitaroInstance.id)
         .outerjoin(_User, Domain.added_by_user_id == _User.id)
     )
-    filters = []
-    if team_id and team_id.strip():
-        filters.append(Team.id == int(team_id))
-    if cf_account_id and cf_account_id.strip():
-        filters.append(CloudflareAccount.id == int(cf_account_id))
-    if status and status.strip():
-        filters.append(Domain.zone_status == DomainStatus(status))
-    if zone and zone.strip():
-        filters.append(Domain.name.like(f"%{zone}"))
-    if search and search.strip():
-        filters.append(Domain.name.ilike(f"%{search}%"))
-    if keitaro_group_id and keitaro_group_id.strip():
-        filters.append(Domain.keitaro_group_id == int(keitaro_group_id))
-    if keitaro_instance_id and keitaro_instance_id.strip():
-        filters.append(KeitaroInstance.id == int(keitaro_instance_id))
-    if no_keitaro and no_keitaro not in ("false", "0", ""):
-        filters.append(Domain.keitaro_group_id.is_(None))
-    if cname_value and cname_value.strip():
-        filters.append(Domain.main_record_value.ilike(f"%{cname_value}%"))
-    if direct_to_kt and direct_to_kt not in ("false", "0", ""):
-        filters.append(Domain.direct_to_keitaro == True)
+    filters = f.build()
+    if days and not (f.search and f.search.strip()):
+        filters.append(Domain.created_at >= _text(f"NOW() - INTERVAL '{int(days)} days'"))
     if filters:
         q = q.where(and_(*filters))
-    q = q.order_by(Domain.name).offset((page - 1) * page_size).limit(page_size)
+    q = q.order_by(Domain.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
 
     result = await db.execute(q)
+    rows = result.all()
+
+    # Abuse-history count per domain (from AbuseAlert), one grouped query
+    # instead of N — keeps the page-load fast even with the join.
+    domain_ids = [domain.id for domain, *_ in rows]
+    abuse_counts: dict[int, int] = {}
+    if domain_ids:
+        cnt_q = (
+            select(AbuseAlert.domain_id, func.count(AbuseAlert.id))
+            .where(AbuseAlert.domain_id.in_(domain_ids), AbuseAlert.new_status == DomainStatus.suspended)
+            .group_by(AbuseAlert.domain_id)
+        )
+        abuse_counts = dict((await db.execute(cnt_q)).all())
+
     out = []
-    for domain, account, team, kt_group, kt_inst, added_by in result.all():
+    for domain, account, team, kt_group, kt_inst, added_by in rows:
         d = DomainOut.model_validate(domain)
         d.cf_account_name = account.name
         d.cf_account_active = account.is_active
@@ -148,6 +193,7 @@ async def list_domains(
         d.keitaro_group_name = kt_group.name if kt_group else None
         d.keitaro_instance_name = kt_inst.name if kt_inst else None
         d.added_by_username = added_by.username if added_by else None
+        d.abuse_count = abuse_counts.get(domain.id, 0)
         out.append(d)
     return out
 
@@ -156,8 +202,20 @@ async def list_domains(
 async def count_domains(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_user),
+    f: DomainFilters = Depends(),
 ):
-    result = await db.execute(select(func.count(Domain.id)))
+    q = (
+        select(func.count(Domain.id))
+        .select_from(Domain)
+        .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
+        .join(Team, CloudflareAccount.team_id == Team.id)
+        .outerjoin(KeitaroDomainGroup, Domain.keitaro_group_id == KeitaroDomainGroup.id)
+        .outerjoin(KeitaroInstance, KeitaroDomainGroup.keitaro_instance_id == KeitaroInstance.id)
+    )
+    filters = f.build()
+    if filters:
+        q = q.where(and_(*filters))
+    result = await db.execute(q)
     return {"count": result.scalar()}
 
 
@@ -918,13 +976,17 @@ async def bulk_dns_by_name(
 ):
     names = [n.strip().lower() for n in data.domains if n.strip()]
     result = await db.execute(select(Domain).where(Domain.name.in_(names)))
-    domain_ids = [d.id for d in result.scalars().all()]
+    found = result.scalars().all()
+    found_names = {d.name for d in found}
+    not_found = [n for n in names if n not in found_names]
+    domain_ids = [d.id for d in found]
     if not domain_ids:
-        return {"ok": 0, "errors": 0, "warnings": [], "results": []}
+        return {"ok": 0, "errors": 0, "warnings": [], "results": [], "not_found": not_found}
     result = await bulk_swap_records(
         domain_ids, data.record_type.value, data.value, data.proxied, db, current_user.username
     )
     await db.commit()
+    result["not_found"] = not_found
     return result
 
 
@@ -951,27 +1013,26 @@ async def get_logs(
 class QuickAddRequest(BaseModel):
     domains: list[str]
     cf_account_id: int
-    kt_instance_id: Optional[int] = None
-    kt_group_id: Optional[int] = None
+    cname: Optional[str] = None
 
 
 @router.post("/quick-add", dependencies=[Depends(require_admin)])
 async def quick_add_domains(data: QuickAddRequest, db: AsyncSession = Depends(get_db),
                              current_user=Depends(require_admin)):
-    """Add domains to CF, optionally set CNAME and add to KT group in one shot."""
+    """Add domains to CF and, optionally, point them at a CNAME target in one shot.
+    Keitaro group assignment is a separate flow (Domains → «До Keitaro»)."""
     account = await db.get(CloudflareAccount, data.cf_account_id)
     if not account:
         raise HTTPException(404, "CF account not found")
 
-    instance = await db.get(KeitaroInstance, data.kt_instance_id) if data.kt_instance_id else None
-    group = await db.get(KeitaroDomainGroup, data.kt_group_id) if data.kt_group_id else None
+    cname_target = (data.cname or "").strip() or None
 
     results = []
     for raw in data.domains:
         name = raw.strip().lower()
         if not name:
             continue
-        item: dict = {"domain": name, "cf_status": None, "name_servers": [], "cname_set": False, "kt_added": False, "cf_error": None}
+        item: dict = {"domain": name, "cf_status": None, "name_servers": [], "cname_set": False, "cf_error": None}
 
         existing = await db.execute(select(Domain).where(Domain.name == name))
         domain_obj = existing.scalar_one_or_none()
@@ -1006,24 +1067,16 @@ async def quick_add_domains(data: QuickAddRequest, db: AsyncSession = Depends(ge
                 results.append(item)
                 continue
 
-        # Set CNAME → KT instance cname
-        if instance and instance.cname and domain_obj and domain_obj.zone_id:
+        # Set CNAME → chosen target
+        if cname_target and domain_obj and domain_obj.zone_id:
             cname_resp = await create_record(
                 account.email, account.api_key, domain_obj.zone_id,
-                "CNAME", name, instance.cname, ttl=1, proxied=True
+                "CNAME", name, cname_target, ttl=1, proxied=True
             )
             if cname_resp.get("success"):
                 item["cname_set"] = True
                 domain_obj.main_record_type = RecordType.CNAME
-                domain_obj.main_record_value = instance.cname
-
-        # Add to KT (group is optional — None means no group)
-        if instance and domain_obj and domain_obj.id:
-            from app.services.keitaro.kt_add import add_domain_to_group
-            kt_res = await add_domain_to_group(domain_obj, instance, group, db, "quick-add")
-            item["kt_added"] = kt_res.get("status") == "ok"
-            if not item["kt_added"]:
-                item["kt_error"] = kt_res.get("detail", "KT error")
+                domain_obj.main_record_value = cname_target
 
         results.append(item)
 

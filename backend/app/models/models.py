@@ -101,6 +101,18 @@ class KeitaroInstance(Base):
     domain_groups = relationship("KeitaroDomainGroup", back_populates="keitaro_instance")
 
 
+class CnameTarget(Base):
+    """Tracker-agnostic CNAME destination for Quick Add — just a label +
+    hostname, no API integration. Lets a team pick a CNAME target (KT,
+    Binom, or anything else) without needing a live KeitaroInstance."""
+    __tablename__ = "cname_targets"
+    id = Column(Integer, primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="CASCADE"), nullable=False)
+    cname = Column(String(256), nullable=False)
+    description = Column(String(256), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class KeitaroDomainGroup(Base):
     __tablename__ = "keitaro_domain_groups"
     id = Column(Integer, primary_key=True)
@@ -460,6 +472,33 @@ class RemoteServer(Base):
     last_status = Column(String(32), nullable=True)    # ok | error
     last_status_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class RecurringPayment(Base):
+    """A recurring bill that must be paid on a cadence — license, KLO, server,
+    AI subscription, VDS, or anything else with a due date. Distinct from
+    `Purchase` (which is a private per-user vault entry): this is team-visible
+    and drives the admin payment-due reminder cron."""
+    __tablename__ = "recurring_payments"
+    id = Column(Integer, primary_key=True)
+    category = Column(String(32), nullable=False)  # license | klo | server | ai | vds | other
+    label = Column(String(256), nullable=False)
+    provider = Column(String(128), nullable=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
+    login = Column(String(256), nullable=True)
+    password_enc = Column(Text, nullable=True)  # Fernet
+    cost_amount = Column(String(32), nullable=True)
+    cost_currency = Column(String(8), nullable=True, default="USD")
+    # Recurrence: next_due_at is the actual next payment date. "Mark as paid"
+    # rolls it forward by billing_period_months instead of requiring the
+    # user to compute the next date by hand each time.
+    billing_period_months = Column(Integer, nullable=False, default=1)
+    next_due_at = Column(DateTime(timezone=True), nullable=True)
+    last_paid_at = Column(DateTime(timezone=True), nullable=True)
+    notes = Column(Text, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 

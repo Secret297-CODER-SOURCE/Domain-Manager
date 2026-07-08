@@ -170,6 +170,35 @@ export default function CloudflarePage() {
   )
 }
 
+// ── Group-by-team helper ────────────────────────────────────────────────
+
+function groupByTeam(accounts, teams) {
+  const teamName = (id) => teams.find(t => t.id === id)?.name || `#${id}`
+  const map = new Map()
+  accounts.forEach(a => {
+    if (!map.has(a.team_id)) map.set(a.team_id, [])
+    map.get(a.team_id).push(a)
+  })
+  return [...map.entries()]
+    .map(([teamId, items]) => ({ teamId, name: teamName(teamId), items }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'uk'))
+}
+
+function TeamGroupHeader({ name, count }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8, padding: '10px 2px 6px',
+      position: 'sticky', top: 0, background: 'var(--bg)', zIndex: 1,
+    }}>
+      <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text3)' }}>
+        {name}
+      </span>
+      <span style={{ fontSize: 11, color: 'var(--text3)' }}>({count})</span>
+      <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+    </div>
+  )
+}
+
 // ── Cloudflare list ──────────────────────────────────────────────────────
 
 function CFList({ teams, search, onEdit, onOpen, gateDelete }) {
@@ -187,37 +216,43 @@ function CFList({ teams, search, onEdit, onOpen, gateDelete }) {
     onSuccess: (r) => toast.success(`Синхронізовано: +${r.data.stats.created} доменів`),
     onError: () => toast.error('Помилка синхронізації'),
   })
-  const teamName = (id) => teams.find(t => t.id === id)?.name || `#${id}`
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return accounts.filter(a =>
       !q || a.name.toLowerCase().includes(q) || (a.email || '').toLowerCase().includes(q)
     )
   }, [accounts, search])
+  const groups = useMemo(() => groupByTeam(filtered, teams), [filtered, teams])
 
   if (isLoading) return <Spinner />
   if (!filtered.length) return <Empty label="Немає CF акаунтів" />
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {filtered.map(a => (
-        <AccountRow key={a.id}
-          color="#f48120" icon={Cloud}
-          title={a.name}
-          subtitle={[a.email, a.created_by_username && `by ${a.created_by_username}`].filter(Boolean).join(' · ')}
-          team={teamName(a.team_id)}
-          active={a.is_active}
-          extra={<>
-            <Badge color={a.domains_count > 0 ? 'blue' : 'default'}>
-              {a.domains_count.toLocaleString('uk-UA')} {a.domains_count === 1 ? 'домен' : 'доменів'}
-            </Badge>
-            {a.account_id && <Badge color="default">{a.account_id.slice(0, 8)}</Badge>}
-          </>}
-          onClick={() => onOpen?.(a.id)}
-          onSync={() => syncMut.mutate(a.id)}
-          onEdit={() => onEdit(a)}
-          onDelete={() => gateDelete(() => delMut.mutateAsync({ teamId: a.team_id, id: a.id })).catch(() => {})}
-        />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {groups.map(g => (
+        <div key={g.teamId}>
+          <TeamGroupHeader name={g.name} count={g.items.length} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {g.items.map(a => (
+              <AccountRow key={a.id}
+                color="#f48120" icon={Cloud}
+                title={a.name}
+                subtitle={[a.email, a.created_by_username && `by ${a.created_by_username}`].filter(Boolean).join(' · ')}
+                active={a.is_active}
+                extra={<>
+                  <Badge color={a.domains_count > 0 ? 'blue' : 'default'}>
+                    {a.domains_count.toLocaleString('uk-UA')} {a.domains_count === 1 ? 'домен' : 'доменів'}
+                  </Badge>
+                  {a.account_id && <Badge color="default">{a.account_id.slice(0, 8)}</Badge>}
+                </>}
+                onClick={() => onOpen?.(a.id)}
+                onSync={() => syncMut.mutate(a.id)}
+                onEdit={() => onEdit(a)}
+                onDelete={() => gateDelete(() => delMut.mutateAsync({ teamId: a.team_id, id: a.id })).catch(() => {})}
+              />
+            ))}
+          </div>
+        </div>
       ))}
     </div>
   )
@@ -240,34 +275,40 @@ function DynList({ teams, search, onEdit, gateDelete }) {
     onSuccess: (r) => { toast.success(`Dynadot: ${r.data.domains_count} доменів`); qc.invalidateQueries({ queryKey: ['dyn-all'] }) },
     onError: (e) => toast.error('Dynadot: ' + (e.response?.data?.detail || 'помилка')),
   })
-  const teamName = (id) => teams.find(t => t.id === id)?.name || `#${id}`
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return accounts.filter(a => !q || a.name.toLowerCase().includes(q))
   }, [accounts, search])
+  const groups = useMemo(() => groupByTeam(filtered, teams), [filtered, teams])
 
   if (isLoading) return <Spinner />
   if (!filtered.length) return <Empty label="Немає Dynadot акаунтів" />
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {filtered.map(a => (
-        <AccountRow key={a.id}
-          color="#2e9cee" icon={Globe}
-          title={a.name}
-          subtitle={[
-            a.last_error
-              ? a.last_error
-              : (a.domains_count != null ? `${a.domains_count} доменів` : 'ще не синхронізовано'),
-            a.created_by_username && `by ${a.created_by_username}`,
-          ].filter(Boolean).join(' · ')}
-          subtitleColor={a.last_error ? 'var(--red)' : undefined}
-          team={teamName(a.team_id)}
-          active={a.is_active}
-          onSync={() => syncMut.mutate(a.id)}
-          onEdit={() => onEdit(a)}
-          onDelete={() => gateDelete(() => delMut.mutateAsync(a.id)).catch(() => {})}
-        />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {groups.map(g => (
+        <div key={g.teamId}>
+          <TeamGroupHeader name={g.name} count={g.items.length} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {g.items.map(a => (
+              <AccountRow key={a.id}
+                color="#2e9cee" icon={Globe}
+                title={a.name}
+                subtitle={[
+                  a.last_error
+                    ? a.last_error
+                    : (a.domains_count != null ? `${a.domains_count} доменів` : 'ще не синхронізовано'),
+                  a.created_by_username && `by ${a.created_by_username}`,
+                ].filter(Boolean).join(' · ')}
+                subtitleColor={a.last_error ? 'var(--red)' : undefined}
+                active={a.is_active}
+                onSync={() => syncMut.mutate(a.id)}
+                onEdit={() => onEdit(a)}
+                onDelete={() => gateDelete(() => delMut.mutateAsync(a.id)).catch(() => {})}
+              />
+            ))}
+          </div>
+        </div>
       ))}
     </div>
   )
@@ -275,7 +316,7 @@ function DynList({ teams, search, onEdit, gateDelete }) {
 
 // ── Shared row ───────────────────────────────────────────────────────────
 
-function AccountRow({ color, icon: Icon, title, subtitle, subtitleColor, team, active, extra, onClick, onSync, onEdit, onDelete }) {
+function AccountRow({ color, icon: Icon, title, subtitle, subtitleColor, active, extra, onClick, onSync, onEdit, onDelete }) {
   return (
     <div onClick={onClick}
       style={{
@@ -304,7 +345,6 @@ function AccountRow({ color, icon: Icon, title, subtitle, subtitleColor, team, a
           </div>
         )}
       </div>
-      <Badge color="blue">{team}</Badge>
       <Badge color={active ? 'green' : 'red'}>
         {active ? <CheckCircle2 size={10} /> : <AlertTriangle size={10} />}
         {active ? ' OK' : ' Off'}
@@ -470,7 +510,7 @@ function CFDetailPanel({ accountId, onClose, onChanged }) {
   })
   const { data: domains = [], isLoading: domLoading, refetch: refetchDomains } = useQuery({
     queryKey: ['cf-domains', accountId],
-    queryFn: () => getDomains({ cf_account_id: accountId }).then(r => r.data),
+    queryFn: () => getDomains({ cf_account_id: accountId, page_size: 2000 }).then(r => r.data),
     enabled: open,
     staleTime: 30000,
   })

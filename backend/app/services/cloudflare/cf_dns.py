@@ -148,7 +148,8 @@ async def swap_main_record(
                     proxied=proxied,
                 ))
                 await db.flush()
-            return {"status": "ok", "domain": domain.name}
+            ns_list = domain.name_servers.split(",") if domain.name_servers else []
+            return {"status": "ok", "domain": domain.name, "name_servers": ns_list}
         else:
             return {"status": "error", "domain": domain.name, "detail": str(resp.get("errors"))}
 

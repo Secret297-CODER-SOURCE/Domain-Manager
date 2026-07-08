@@ -10,6 +10,7 @@ Flow:
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 import json
@@ -23,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import get_current_user
 from app.core.crypto import encrypt_secret
 from app.db.session import get_db
-from app.models.models import User, RemoteServer, MailAccount, Note, Spreadsheet
+from app.models.models import User, RemoteServer, MailAccount, Note, Spreadsheet, RecurringPayment
 from app.services.google_sheets import (
     discover_tabs, fetch_tab, extract_sheet_id, fetch_tab_csv, parse_csv,
 )
@@ -47,9 +48,10 @@ class PreviewIn(BaseModel):
 class RunIn(BaseModel):
     url: str
     gid: str
-    target: str  # servers | mail | notes
+    target: str  # servers | mail | notes | payments
     column_map: Dict[str, str]   # entity_field → sheet header
     tab_name: Optional[str] = None  # used for notes title
+    category: Optional[str] = None  # payments only: license | klo | server | ai | vds | other
 
 
 class LocalPreviewIn(BaseModel):
@@ -67,9 +69,10 @@ class LocalRunIn(BaseModel):
 
 class BatchItem(BaseModel):
     gid: str
-    target: str                       # servers | mail | notes
+    target: str                       # servers | mail | notes | payments
     column_map: Dict[str, str]
     tab_name: Optional[str] = None
+    category: Optional[str] = None    # payments only
 
 
 class BatchRunIn(BaseModel):
@@ -101,6 +104,58 @@ MAIL_HINTS = {
     "tags":     ["tag", "тег"],
     "notes":    ["примітк", "примечан", "коммент", "коммент", "імап", "imap"],
 }
+PAYMENT_HINTS = {
+    "label":       ["name", "label", "назва", "сервіс", "service", "регіон", "регион"],
+    "provider":    ["provider", "url", "провайдер", "сервіс", "service"],
+    "login":       ["login", "почта", "пошта", "email", "mail"],
+    "password":    ["pass", "пароль"],
+    "next_due_at": ["термін", "строк", "дата", "due", "expire", "protect", "закінч"],
+    "notes":       ["geo", "примітк", "примечан", "коммент", "ip"],
+}
+
+
+# ── Flexible date parsing for the messy real-world "коли платити" columns ──
+# These sheets mix MM/DD/YY, DD/MM/YYYY, ISO and "Jul 22, 2026" in the same
+# column, so we try several formats and let the caller show the guess next
+# to the original raw text for human confirmation rather than trusting it.
+_DATE_FORMATS = [
+    "%Y-%m-%d", "%m/%d/%y", "%d.%m.%Y", "%m/%d/%Y", "%d/%m/%Y", "%b %d, %Y", "%B %d, %Y",
+]
+
+
+def _parse_flexible_date(raw: str):
+    s = (raw or "").strip()
+    if not s:
+        return None
+    s = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", s, flags=re.I)  # "June 5th, 2026" -> "June 5, 2026"
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _guess_payment_map(headers: List[str], rows: List[Dict[str, str]]) -> Dict[str, str]:
+    """Header-hint pass (shared _guess_map already covers password-by-value-type
+    too), then a value-based fallback for next_due_at since these sheets often
+    leave the due-date column unlabeled (col9/col10/...)."""
+    out = _guess_map(PAYMENT_HINTS, headers, rows)
+    if "next_due_at" not in out:
+        used = set(out.values())
+        best_header, best_ratio = None, 0.0
+        for h in headers:
+            if h in used:
+                continue
+            vals = [r.get(h, "") for r in rows if (r.get(h) or "").strip()]
+            if not vals:
+                continue
+            ratio = sum(1 for v in vals if _parse_flexible_date(v)) / len(vals)
+            if ratio > 0.5 and ratio > best_ratio:
+                best_header, best_ratio = h, ratio
+        if best_header:
+            out["next_due_at"] = best_header
+    return out
 
 
 # ── Value-type classifier (looks at the data itself) ────────────────────
@@ -282,8 +337,10 @@ def _analyze(parsed: Dict[str, Any], tab_name: str = "", limit: int = 20) -> Dic
     col_types     = column_types(headers, rows)
     guess_servers = _guess_map(SERVER_HINTS, headers, rows)
     guess_mail    = _guess_map(MAIL_HINTS,    headers, rows)
+    guess_payments = _guess_payment_map(headers, rows)
     can_servers   = "host"  in guess_servers
     can_mail      = "email" in guess_mail
+    can_payments  = "label" in guess_payments
 
     row_routes = [classify_row(r, col_types) for r in rows]
     route_counts = {
@@ -293,17 +350,18 @@ def _analyze(parsed: Dict[str, Any], tab_name: str = "", limit: int = 20) -> Dic
     }
     can_auto = route_counts["servers"] > 0 or route_counts["mail"] > 0
 
-    if route_counts["servers"] > 0 and route_counts["mail"] > 0:
+    name_hint = _guess_target_by_tab(tab_name)
+    if name_hint == "payments" and can_payments:
+        suggested = "payments"
+    elif route_counts["servers"] > 0 and route_counts["mail"] > 0:
         suggested = "auto"
     elif route_counts["servers"] > 0 and can_servers:
         suggested = "servers"
     elif route_counts["mail"] > 0 and can_mail:
         suggested = "mail"
-    else:
-        name_hint = _guess_target_by_tab(tab_name)
-        if name_hint == "servers" and can_servers: suggested = "servers"
-        elif name_hint == "mail"  and can_mail:    suggested = "mail"
-        else: suggested = "notes"
+    elif name_hint == "servers" and can_servers: suggested = "servers"
+    elif name_hint == "mail"  and can_mail:    suggested = "mail"
+    else: suggested = "notes"
 
     return {
         "headers": headers,
@@ -311,11 +369,12 @@ def _analyze(parsed: Dict[str, Any], tab_name: str = "", limit: int = 20) -> Dic
         "rows": rows[:limit],
         "total_rows": parsed["total_rows"],
         "column_types": col_types,
-        "guess": {"servers": guess_servers, "mail": guess_mail},
+        "guess": {"servers": guess_servers, "mail": guess_mail, "payments": guess_payments},
         "route_counts": route_counts,
         "suggested_target": suggested,
         "can_servers": can_servers,
         "can_mail":    can_mail,
+        "can_payments": can_payments,
         "can_auto":    can_auto,
     }
 
@@ -332,7 +391,7 @@ async def preview(data: PreviewIn, user: User = Depends(get_current_user)):
 
 
 async def _run_one_tab(db: AsyncSession, user: User, parsed: Dict[str, Any], target: str,
-                       column_map: Dict[str, str], tab_name: str) -> Dict[str, Any]:
+                       column_map: Dict[str, str], tab_name: str, category: Optional[str] = None) -> Dict[str, Any]:
     """Shared run-once logic supporting all targets including 'auto'."""
     headers = parsed["headers"]
     rows = parsed["rows"]
@@ -372,19 +431,21 @@ async def _run_one_tab(db: AsyncSession, user: User, parsed: Dict[str, Any], tar
         return await _import_mail(db, user, rows, column_map)
     if target == "notes":
         return await _import_notes(db, user, headers, rows, tab_name or "Imported sheet")
-    raise HTTPException(400, "target має бути servers / mail / notes / auto")
+    if target == "payments":
+        return await _import_payments(db, user, rows, column_map, headers, category or "other")
+    raise HTTPException(400, "target має бути servers / mail / notes / payments / auto")
 
 
 @router.post("/run")
 async def run(data: RunIn, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
-    if data.target not in ("servers", "mail", "notes", "auto"):
-        raise HTTPException(400, "target має бути servers / mail / notes / auto")
+    if data.target not in ("servers", "mail", "notes", "payments", "auto"):
+        raise HTTPException(400, "target має бути servers / mail / notes / payments / auto")
     sid = extract_sheet_id(data.url)
     try:
         parsed = await fetch_tab(sid, data.gid)
     except Exception as e:
         raise HTTPException(400, f"CSV: {e}")
-    return await _run_one_tab(db, user, parsed, data.target, data.column_map, data.tab_name or "")
+    return await _run_one_tab(db, user, parsed, data.target, data.column_map, data.tab_name or "", data.category)
 
 
 # ── Batch (multi-tab) Google Sheets import ─────────────────────────────
@@ -394,6 +455,7 @@ import asyncio as _asyncio
 
 def _guess_target_by_tab(name: str) -> str:
     lc = (name or "").lower()
+    if any(kw in lc for kw in ("ліценз", "лицен", "оплат", "вдс", "payment")): return "payments"
     if any(kw in lc for kw in ("vps", "server", "сервер")):       return "servers"
     if any(kw in lc for kw in ("mail", "пошт", "почт", "email")): return "mail"
     return "notes"
@@ -430,8 +492,10 @@ async def batch_discover(data: BatchDiscoverIn, user: User = Depends(get_current
                 # Two-pass auto-mapping (header + value type)
                 guess_servers = _guess_map(SERVER_HINTS, headers, rows)
                 guess_mail    = _guess_map(MAIL_HINTS,    headers, rows)
+                guess_payments = _guess_payment_map(headers, rows)
                 can_servers = "host"  in guess_servers
                 can_mail    = "email" in guess_mail
+                can_payments = "label" in guess_payments
 
                 # Per-row classification → counts for "auto" target
                 row_routes = [classify_row(r, col_types) for r in rows]
@@ -441,19 +505,21 @@ async def batch_discover(data: BatchDiscoverIn, user: User = Depends(get_current
                     "skip":    sum(1 for x in row_routes if x == "skip"),
                 }
 
-                # Suggested target: prefer auto if mixed types, else single
-                if route_counts["servers"] > 0 and route_counts["mail"] > 0:
+                # Suggested target: name hint wins for payments (due-date sheets
+                # rarely look like a clean server/mail row), else prefer auto
+                # if mixed types, else single.
+                name_hint = _guess_target_by_tab(tab["name"])
+                if name_hint == "payments" and can_payments:
+                    suggested = "payments"
+                elif route_counts["servers"] > 0 and route_counts["mail"] > 0:
                     suggested = "auto"
                 elif route_counts["servers"] > 0 and can_servers:
                     suggested = "servers"
                 elif route_counts["mail"] > 0 and can_mail:
                     suggested = "mail"
-                else:
-                    # Fall back to name-based hint
-                    name_hint = _guess_target_by_tab(tab["name"])
-                    if name_hint == "servers" and can_servers: suggested = "servers"
-                    elif name_hint == "mail"  and can_mail:    suggested = "mail"
-                    else: suggested = "notes"
+                elif name_hint == "servers" and can_servers: suggested = "servers"
+                elif name_hint == "mail"  and can_mail:    suggested = "mail"
+                else: suggested = "notes"
 
                 return {
                     "gid": tab["gid"], "name": tab["name"], "index": tab.get("index", 0),
@@ -462,11 +528,12 @@ async def batch_discover(data: BatchDiscoverIn, user: User = Depends(get_current
                     "rows_sample": rows[: data.preview_limit],
                     "total_rows": parsed["total_rows"],
                     "column_types": col_types,
-                    "guess": {"servers": guess_servers, "mail": guess_mail},
+                    "guess": {"servers": guess_servers, "mail": guess_mail, "payments": guess_payments},
                     "route_counts": route_counts,
                     "suggested_target": suggested,
                     "can_servers": can_servers,
                     "can_mail": can_mail,
+                    "can_payments": can_payments,
                     "can_auto": route_counts["servers"] > 0 or route_counts["mail"] > 0,
                     "error": None,
                 }
@@ -474,9 +541,10 @@ async def batch_discover(data: BatchDiscoverIn, user: User = Depends(get_current
                 return {
                     "gid": tab["gid"], "name": tab["name"], "index": tab.get("index", 0),
                     "headers": [], "headerless": False, "rows_sample": [], "total_rows": 0,
-                    "column_types": {}, "guess": {"servers": {}, "mail": {}},
+                    "column_types": {}, "guess": {"servers": {}, "mail": {}, "payments": {}},
                     "route_counts": {"servers": 0, "mail": 0, "skip": 0},
                     "suggested_target": "notes", "can_servers": False, "can_mail": False,
+                    "can_payments": False,
                     "can_auto": False,
                     "error": str(e)[:200],
                 }
@@ -501,7 +569,7 @@ async def batch_run(data: BatchRunIn, db: AsyncSession = Depends(get_db), user: 
     totals = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
 
     for item in data.items:
-        if item.target not in ("servers", "mail", "notes", "auto"):
+        if item.target not in ("servers", "mail", "notes", "payments", "auto"):
             out_items.append({"gid": item.gid, "tab_name": item.tab_name, "target": item.target,
                               "ok": False, "error": "Невідома сутність"})
             totals["errors"] += 1
@@ -547,6 +615,8 @@ async def batch_run(data: BatchRunIn, db: AsyncSession = Depends(get_db), user: 
                 res = await _import_servers(db, user, rows, item.column_map)
             elif item.target == "mail":
                 res = await _import_mail(db, user, rows, item.column_map)
+            elif item.target == "payments":
+                res = await _import_payments(db, user, rows, item.column_map, headers, item.category or "other")
             else:
                 res = await _import_notes(db, user, headers, rows, item.tab_name or "Imported sheet")
             out_items.append({"gid": item.gid, "tab_name": item.tab_name, "target": item.target,
@@ -889,6 +959,74 @@ async def _import_mail(db: AsyncSession, user: User, rows: List[Dict[str, str]],
 
     await db.flush()
     return {"ok": True, "target": "mail", "created": created, "updated": updated,
+            "skipped": skipped, "errors": errors[:5]}
+
+
+async def _import_payments(db: AsyncSession, user: User, rows: List[Dict[str, str]],
+                            cmap: Dict[str, str], headers: List[str], category: str = "other"):
+    """Upsert RecurringPayment rows, keyed by (category, label) since these
+    sheets have no stable unique id. Any column not mapped to a known field
+    (IP, root password, geo, ...) is folded into notes instead of being
+    silently dropped — the model has no dedicated slot for them."""
+    if "label" not in cmap:
+        raise HTTPException(400, "Потрібно вказати колонку для назви (label)")
+    existing = (await db.execute(
+        select(RecurringPayment).where(RecurringPayment.category == category)
+    )).scalars().all()
+    by_label = {(p.label or "").strip().lower(): p for p in existing}
+    used_headers = set(cmap.values())
+
+    created = updated = skipped = 0
+    errors: List[str] = []
+
+    for row in rows:
+        try:
+            label = _get(row, cmap, "label")
+            if not label:
+                skipped += 1
+                continue
+            provider = _get(row, cmap, "provider")
+            login    = _get(row, cmap, "login")
+            password = _get(row, cmap, "password")
+            hint_notes = _get(row, cmap, "notes")
+            due_raw  = _get(row, cmap, "next_due_at")
+            due_dt   = _parse_flexible_date(due_raw) if due_raw else None
+
+            leftover = [f"{h}: {row[h]}" for h in headers
+                        if h not in used_headers and (row.get(h) or "").strip()]
+            notes_parts = ([hint_notes] if hint_notes else []) + leftover
+            notes = " · ".join(notes_parts) or None
+
+            key = label.strip().lower()
+            obj = by_label.get(key)
+            if obj is None:
+                obj = RecurringPayment(
+                    category=category, label=label,
+                    provider=provider or None,
+                    login=login or None,
+                    password_enc=encrypt_secret(password) if password else None,
+                    next_due_at=due_dt,
+                    notes=notes,
+                    created_by_user_id=user.id,
+                )
+                db.add(obj)
+                by_label[key] = obj
+                created += 1
+            else:
+                changed = False
+                if provider and obj.provider != provider: obj.provider = provider; changed = True
+                if login and obj.login != login: obj.login = login; changed = True
+                if password: obj.password_enc = encrypt_secret(password); changed = True
+                if due_dt and obj.next_due_at != due_dt: obj.next_due_at = due_dt; changed = True
+                if notes and obj.notes != notes: obj.notes = notes; changed = True
+                if changed: updated += 1
+                else: skipped += 1
+        except Exception as e:
+            errors.append(str(e)[:200])
+            skipped += 1
+
+    await db.flush()
+    return {"ok": True, "target": "payments", "created": created, "updated": updated,
             "skipped": skipped, "errors": errors[:5]}
 
 

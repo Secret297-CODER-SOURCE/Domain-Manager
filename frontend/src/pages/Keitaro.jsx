@@ -752,7 +752,7 @@ function AddToKTModal({ open, onClose, onSuccess }) {
   })
   const { data: domains = [] } = useQuery({
     queryKey: ['domains-nkt'],
-    queryFn: () => getDomains({ no_keitaro: true }).then(r => r.data),
+    queryFn: () => getDomains({ no_keitaro: true, page_size: 2000 }).then(r => r.data),
     enabled: open,
   })
   const { data: ktInstances = [] } = useQuery({

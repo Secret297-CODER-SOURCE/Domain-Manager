@@ -13,7 +13,7 @@ from app.models.models import (
     CloudflareAccount, Domain, DomainStatus, RecordType, ActionLog, AbuseAlert,
     DnsRecord,
 )
-from app.services.cloudflare.cf_zones import fetch_zones, fetch_dns_records, verify_account
+from app.services.cloudflare.cf_zones import fetch_zones, fetch_dns_records, verify_account, CFAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +53,18 @@ async def sync_account(account: CloudflareAccount, db: AsyncSession) -> dict:
 
     try:
         zones = await fetch_zones(account.email, account.api_key)
-    except Exception as e:
-        logger.error(f"[sync] fetch_zones error for {account.name}: {e}")
+    except CFAuthError as e:
+        # CF rejected the credentials outright — the token really is dead.
+        logger.error(f"[sync] {account.name}: credentials rejected by CF: {e}")
         account.is_active = False
         await db.flush()
+        stats["errors"] += 1
+        return stats
+    except Exception as e:
+        # Transient — rate limit, timeout, CF-side 5xx, network blip. Leave
+        # is_active untouched so the next scheduled sync just retries,
+        # instead of permanently excluding a perfectly valid account.
+        logger.error(f"[sync] fetch_zones transient error for {account.name}: {e}")
         stats["errors"] += 1
         return stats
 

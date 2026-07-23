@@ -1317,17 +1317,31 @@ async def refresh_cf_abuse_cache(db: AsyncSession) -> list[dict]:
                 key = (account.id, name)
                 counts[key] = counts.get(key, 0) + 1
 
-        await db.execute(
-            update(Domain).where(Domain.cf_account_id.in_([a.id for a in accounts]))
-            .values(cf_abuse_report_count=0)
-        )
-        for (account_id, name), cnt in counts.items():
-            await db.execute(
-                update(Domain)
-                .where(Domain.cf_account_id == account_id, func.lower(Domain.name) == name)
-                .values(cf_abuse_report_count=cnt)
-            )
-        await db.commit()
+        # This writes to `domains` in the same post-deploy window as
+        # daily_sync_job, which also updates `domains` — retry on deadlock
+        # (Postgres aborts one of two conflicting transactions; a retry
+        # almost always succeeds since it's a transient lock conflict).
+        from sqlalchemy.exc import DBAPIError
+        for attempt in range(3):
+            try:
+                await db.execute(
+                    update(Domain).where(Domain.cf_account_id.in_([a.id for a in accounts]))
+                    .values(cf_abuse_report_count=0)
+                )
+                for (account_id, name), cnt in counts.items():
+                    await db.execute(
+                        update(Domain)
+                        .where(Domain.cf_account_id == account_id, func.lower(Domain.name) == name)
+                        .values(cf_abuse_report_count=cnt)
+                    )
+                await db.commit()
+                break
+            except DBAPIError as e:
+                await db.rollback()
+                if "deadlock" not in str(e).lower() or attempt == 2:
+                    _abuse_log.error(f"[cf_abuse_refresh] failed to persist counts: {e}")
+                    break
+                await _asyncio.sleep(0.5 * (attempt + 1))
         return combined
 
 

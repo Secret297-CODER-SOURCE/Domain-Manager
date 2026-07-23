@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
+    # Service-to-service integration with DomainGuard
+    EXTERNAL_API_KEY: Optional[str] = None
+    DOMAINGUARD_WEBHOOK_URL: Optional[str] = None
+    DOMAINGUARD_WEBHOOK_SECRET: Optional[str] = None
+
     class Config:
         env_file = ".env"
 

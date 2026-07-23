@@ -1,9 +1,10 @@
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, delete
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from app.db.session import get_db
 from app.models.models import (
     Domain, CloudflareAccount, Team, DnsRecord,
@@ -44,6 +45,8 @@ class DomainOut(BaseModel):
     added_by_user_id: Optional[int] = None
     added_by_username: Optional[str] = None
     abuse_count: int = 0
+    removed_from_cf: bool = False
+    abuse_reason: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -401,13 +404,42 @@ async def delete_all_dns(domain_id: int, db: AsyncSession = Depends(get_db)):
     return {"ok": True, "deleted": deleted}
 
 
+# ── Abuse reason formatting + soft-delete ──────────────────────────────────
+# CF's abuse-reports API returns `type` (PHISH/DMCA/...) and `original_work`
+# (targeted brand, e.g. "Ziraat Bank"). We render that as "Phishing: Ziraat Bank".
+
+_ABUSE_TYPE_LABELS = {
+    "PHISH": "Phishing", "GEN": "General", "THREAT": "Threat", "DMCA": "DMCA",
+    "EMER": "Emergency", "TM": "Trademark", "REG_WHO": "Registrar/WHOIS",
+    "NCSEI": "NCSEI", "NETWORK": "Network Abuse",
+}
+
+
+def format_abuse_reason(report_type: str | None, original_work: str | None) -> str:
+    label = _ABUSE_TYPE_LABELS.get((report_type or "").upper(), report_type or "Abuse")
+    return f"{label}: {original_work}" if original_work else label
+
+
+async def soft_delete_domain(db: AsyncSession, domain: Domain, reason: str | None = None) -> None:
+    """Remove a domain's DNS footprint but keep the row (and its history).
+    Called after the zone itself has already been deleted from Cloudflare."""
+    await db.execute(delete(DnsRecord).where(DnsRecord.domain_id == domain.id))
+    domain.main_record_type = None
+    domain.main_record_value = None
+    domain.removed_from_cf = True
+    if reason:
+        domain.abuse_reason = reason
+
+
 class BulkAbuseDeleteRequest(BaseModel):
     domains: list[str]  # list of domain names
 
 @router.post("/bulk-abuse-delete", dependencies=[Depends(require_admin)])
 async def bulk_abuse_delete(data: BulkAbuseDeleteRequest, db: AsyncSession = Depends(get_db)):
-    """Delete multiple domains from CF without OTP — for abuse report cleanup."""
+    """Remove multiple domains from CF without OTP — for abuse report cleanup.
+    Domain rows are kept (soft-deleted) so team/DNS/abuse history isn't lost."""
     results = []
+    reason_cache: dict[int, dict[str, str]] = {}  # cf_account_id -> {domain_name: reason}
     for name in data.domains:
         name = name.lower().strip()
         row = (await db.execute(
@@ -422,15 +454,35 @@ async def bulk_abuse_delete(data: BulkAbuseDeleteRequest, db: AsyncSession = Dep
         domain, account, team = row
         ok = await delete_full_zone_from_cf(account.email, account.api_key, domain.zone_id)
         db.add(ActionLog(action="full_delete_cf", domain=domain.name, details=f"abuse|{team.name}|{account.name}"))
-        await db.delete(domain)
+
+        if account.id not in reason_cache:
+            try:
+                reports = await _fetch_cf_abuse(account) if account.is_active else []
+            except Exception:
+                reports = []
+            reason_cache[account.id] = {r["domain"].lower(): r["reason"] for r in reports if r.get("domain")}
+        reason = reason_cache[account.id].get(name)
+
+        await soft_delete_domain(db, domain, reason)
         results.append({"domain": name, "ok": ok})
+
+        from app.services.domainguard_notify import notify_domainguard_abuse
+        asyncio.create_task(notify_domainguard_abuse(
+            team_id=team.id,
+            domain=domain.name,
+            cf_account_email=account.email,
+            severity="high",
+            category="removed",
+            message=reason or "Zone removed from Cloudflare (abuse cleanup)",
+        ))
     await db.commit()
     return {"results": results}
 
 
 @router.delete("/{domain_id}/full-delete", dependencies=[Depends(require_delete_token)])
 async def full_delete_from_cf(domain_id: int, db: AsyncSession = Depends(get_db)):
-    """Fully remove zone from Cloudflare AND from our DB."""
+    """Remove zone from Cloudflare. Domain row is kept (soft-deleted) — this
+    is a manual single-domain action with no CF abuse-report context to attach."""
     result = await db.execute(
         select(Domain, CloudflareAccount, Team)
         .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
@@ -443,8 +495,18 @@ async def full_delete_from_cf(domain_id: int, db: AsyncSession = Depends(get_db)
     domain, account, team = row
     ok = await delete_full_zone_from_cf(account.email, account.api_key, domain.zone_id)
     db.add(ActionLog(action="full_delete_cf", domain=domain.name, details=f"manual|{team.name}|{account.name}"))
-    await db.delete(domain)
+    await soft_delete_domain(db, domain)
     await db.commit()
+
+    from app.services.domainguard_notify import notify_domainguard_abuse
+    asyncio.create_task(notify_domainguard_abuse(
+        team_id=team.id,
+        domain=domain.name,
+        cf_account_email=account.email,
+        severity="medium",
+        category="removed",
+        message="Zone removed from Cloudflare (manual)",
+    ))
     return {"ok": ok}
 
 
@@ -908,7 +970,10 @@ async def stats_ban_reasons(db: AsyncSession = Depends(get_db)):
     by_type: dict[str, int] = {}
     by_account: dict[str, int] = {}
     for r in reports:
-        t = (r.get("type") or "unknown").strip() or "unknown"
+        # Full "Category: Targeted brand" (e.g. "Phishing: Ziraat Bank") when
+        # CF supplied original_work, same formatting as the Domains table —
+        # falls back to just the category label when it didn't.
+        t = r.get("reason") or (r.get("type") or "unknown").strip() or "unknown"
         by_type[t] = by_type.get(t, 0) + 1
         a = r.get("cf_account") or "?"
         by_account[a] = by_account.get(a, 0) + 1
@@ -1166,7 +1231,7 @@ async def _fetch_cf_abuse(account: CloudflareAccount) -> list[dict]:
         elif isinstance(result, dict):
             for key in ("reports", "items", "abuse_reports"):
                 if key in result:
-                    reports = result[key]
+                    reports = result[key] or []
                     break
             else:
                 if "id" in result:
@@ -1192,6 +1257,8 @@ async def _fetch_cf_abuse(account: CloudflareAccount) -> list[dict]:
                 "id": rep.get("id"),
                 "domain": domain or "unknown",
                 "type": rep.get("type"),
+                "original_work": rep.get("original_work"),
+                "reason": format_abuse_reason(rep.get("type"), rep.get("original_work")),
                 "status": rep.get("status"),
                 "created_at": rep.get("cdate") or rep.get("created_on") or rep.get("created_at"),
                 "cf_account": account.name,
@@ -1203,14 +1270,42 @@ async def _fetch_cf_abuse(account: CloudflareAccount) -> list[dict]:
         return []
 
 
+# Live CF abuse-reports are slow to fetch (one HTTP round-trip per active CF
+# account) and were being re-fetched on every Dashboard load — both the abuse
+# widget and the "Причини банів" stats card called this independently, so a
+# single page load could trigger the full live scan twice. Cache the combined
+# result and refresh it once an hour via `cf_abuse_refresh_job` (main.py)
+# instead. `_cf_abuse_lock` prevents a fetch stampede if several requests
+# land while the cache is still empty right after a fresh deploy.
+_cf_abuse_cache: dict = {"reports": [], "updated_at": None}
+_cf_abuse_lock = _asyncio.Lock()
+
+
+async def refresh_cf_abuse_cache(db: AsyncSession) -> list[dict]:
+    """Live-fetch abuse reports for all active CF accounts and cache them."""
+    async with _cf_abuse_lock:
+        result = await db.execute(
+            select(CloudflareAccount).where(CloudflareAccount.is_active == True)
+        )
+        accounts = result.scalars().all()
+        all_reports = await _asyncio.gather(*[_fetch_cf_abuse(acc) for acc in accounts])
+        combined = [r for sublist in all_reports for r in sublist]
+        combined.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        _cf_abuse_cache["reports"] = combined
+        _cf_abuse_cache["updated_at"] = datetime.now(timezone.utc)
+        return combined
+
+
 @router.get("/cf-abuse-reports", dependencies=[Depends(get_current_user)])
 async def get_cf_abuse_reports(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(CloudflareAccount).where(CloudflareAccount.is_active == True)
-    )
-    accounts = result.scalars().all()
-    all_reports = await _asyncio.gather(*[_fetch_cf_abuse(acc) for acc in accounts])
-    combined = [r for sublist in all_reports for r in sublist]
-    # Sort by created_at desc
-    combined.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-    return combined
+    """Serve the hourly-refreshed cache. Falls back to a live fetch only if
+    the cache has never been populated yet (fresh deploy, before the first
+    scheduled run)."""
+    if _cf_abuse_cache["updated_at"] is None:
+        return await refresh_cf_abuse_cache(db)
+    return _cf_abuse_cache["reports"]
+
+
+@router.get("/cf-abuse-reports/refreshed-at", dependencies=[Depends(get_current_user)])
+async def cf_abuse_reports_refreshed_at():
+    return {"updated_at": _cf_abuse_cache["updated_at"]}

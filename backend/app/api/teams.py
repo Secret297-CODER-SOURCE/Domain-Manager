@@ -7,9 +7,10 @@ from typing import Optional
 from app.db.session import get_db
 import asyncio
 import logging
+import secrets
 
 from app.db.session import AsyncSessionLocal
-from app.models.models import Team, CloudflareAccount, KeitaroInstance, CnameTarget, Purchase, User
+from app.models.models import Team, CloudflareAccount, KeitaroInstance, CnameTarget, Purchase, User, BurncheckInstance
 from app.core.security import require_admin, get_current_user, require_delete_token
 from app.services.cloudflare.cf_zones import verify_account
 from app.services.audit import log_action
@@ -76,11 +77,13 @@ router = APIRouter(prefix="/api/teams", tags=["teams"])
 class TeamCreate(BaseModel):
     name: str
     description: Optional[str] = None
+    code: Optional[str] = None
 
 class TeamOut(BaseModel):
     id: int
     name: str
     description: Optional[str]
+    code: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -127,6 +130,26 @@ class KTInstanceOut(BaseModel):
     url: str
     cname: Optional[str]
     is_active: bool
+    class Config:
+        from_attributes = True
+
+class BurncheckInstanceCreate(BaseModel):
+    label: str
+    webhook_url: Optional[str] = None
+    allowed_ip: Optional[str] = None
+
+class BurncheckInstanceUpdate(BaseModel):
+    label: Optional[str] = None
+    webhook_url: Optional[str] = None
+    allowed_ip: Optional[str] = None
+
+class BurncheckInstanceOut(BaseModel):
+    id: int
+    team_id: int
+    label: str
+    webhook_url: Optional[str]
+    api_key: str
+    allowed_ip: Optional[str]
     class Config:
         from_attributes = True
 
@@ -184,7 +207,8 @@ async def list_teams(db: AsyncSession = Depends(get_db), _=Depends(get_current_u
 @router.post("", response_model=TeamOut, dependencies=[Depends(require_admin)])
 async def create_team(data: TeamCreate, db: AsyncSession = Depends(get_db),
                        user: User = Depends(get_current_user)):
-    team = Team(name=data.name, description=data.description)
+    team = Team(name=data.name, description=data.description,
+                code=(data.code.strip() or None) if data.code else None)
     db.add(team)
     log_action(db, "team_add", user=user, target=data.name,
                details={"description": data.description})
@@ -195,6 +219,7 @@ async def create_team(data: TeamCreate, db: AsyncSession = Depends(get_db),
 class TeamUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    code: Optional[str] = None
 
 @router.patch("/{team_id}", response_model=TeamOut, dependencies=[Depends(require_admin)])
 async def update_team(team_id: int, data: TeamUpdate, db: AsyncSession = Depends(get_db)):
@@ -206,6 +231,8 @@ async def update_team(team_id: int, data: TeamUpdate, db: AsyncSession = Depends
         team.name = data.name.strip()
     if data.description is not None:
         team.description = data.description.strip() or None
+    if data.code is not None:
+        team.code = data.code.strip() or None
     await db.flush()
     await db.refresh(team)
     await db.commit()
@@ -427,13 +454,15 @@ async def cf_account_cleanup(account_id: int, data: CFCleanupRequest,
         for d in rows:
             targets[d.id] = d
 
+    reason_by_name: dict[str, str] = {}
     if data.mode in ("cf_abuse", "both"):
         try:
             from app.api.domains import _fetch_cf_abuse
             reports = await _fetch_cf_abuse(acc) if acc.is_active else []
         except Exception:
             reports = []
-        names = {(r.get("domain") or "").lower() for r in reports}
+        reason_by_name = {(r.get("domain") or "").lower(): r["reason"] for r in reports if r.get("domain")}
+        names = set(reason_by_name.keys())
         if names:
             rows = (await db.execute(
                 select(Domain).where(
@@ -448,6 +477,8 @@ async def cf_account_cleanup(account_id: int, data: CFCleanupRequest,
     if data.dry_run:
         return {"dry_run": True, "mode": data.mode, "candidates": candidates, "count": len(candidates)}
 
+    from app.api.domains import soft_delete_domain
+
     results = []
     for d in list(targets.values()):
         ok = await delete_full_zone_from_cf(acc.email, acc.api_key, d.zone_id)
@@ -456,7 +487,7 @@ async def cf_account_cleanup(account_id: int, data: CFCleanupRequest,
             domain=d.name,
             details=f"cleanup-{data.mode}|{team.name if team else '—'}|{acc.name}",
         ))
-        await db.delete(d)
+        await soft_delete_domain(db, d, reason_by_name.get(d.name.lower()))
         results.append({"domain": d.name, "ok": ok})
     await db.commit()
     return {"dry_run": False, "mode": data.mode, "results": results, "count": len(results)}
@@ -548,4 +579,75 @@ async def delete_cname_target(team_id: int, target_id: int, db: AsyncSession = D
     if not target:
         raise HTTPException(404, "CNAME target not found")
     await db.delete(target)
+    return {"ok": True}
+
+
+# ── BurnCheck instances (per-team registration for /api/external push+pull) ──
+
+@router.get("/{team_id}/burncheck-instances", response_model=list[BurncheckInstanceOut],
+            dependencies=[Depends(require_admin)])
+async def list_burncheck_instances(team_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BurncheckInstance).where(BurncheckInstance.team_id == team_id))
+    return result.scalars().all()
+
+@router.post("/{team_id}/burncheck-instances", response_model=BurncheckInstanceOut,
+             dependencies=[Depends(require_admin)])
+async def add_burncheck_instance(team_id: int, data: BurncheckInstanceCreate, db: AsyncSession = Depends(get_db)):
+    team = await db.get(Team, team_id)
+    if not team:
+        raise HTTPException(404, "Team not found")
+    instance = BurncheckInstance(
+        team_id=team_id, label=data.label,
+        webhook_url=(data.webhook_url or "").strip() or None,
+        allowed_ip=(data.allowed_ip or "").strip() or None,
+        api_key=secrets.token_urlsafe(32),
+    )
+    db.add(instance)
+    await db.flush()
+    await db.refresh(instance)
+    await db.commit()
+    return instance
+
+@router.patch("/{team_id}/burncheck-instances/{instance_id}", response_model=BurncheckInstanceOut,
+              dependencies=[Depends(require_admin)])
+async def update_burncheck_instance(team_id: int, instance_id: int, data: BurncheckInstanceUpdate,
+                                     db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BurncheckInstance).where(
+        BurncheckInstance.id == instance_id, BurncheckInstance.team_id == team_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    if data.label is not None and data.label.strip():
+        instance.label = data.label.strip()
+    if data.webhook_url is not None:
+        instance.webhook_url = data.webhook_url.strip() or None
+    if data.allowed_ip is not None:
+        instance.allowed_ip = data.allowed_ip.strip() or None
+    await db.flush()
+    await db.refresh(instance)
+    await db.commit()
+    return instance
+
+@router.post("/{team_id}/burncheck-instances/{instance_id}/rotate-key", response_model=BurncheckInstanceOut,
+             dependencies=[Depends(require_admin)])
+async def rotate_burncheck_instance_key(team_id: int, instance_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BurncheckInstance).where(
+        BurncheckInstance.id == instance_id, BurncheckInstance.team_id == team_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    instance.api_key = secrets.token_urlsafe(32)
+    await db.flush()
+    await db.refresh(instance)
+    await db.commit()
+    return instance
+
+@router.delete("/{team_id}/burncheck-instances/{instance_id}", dependencies=[Depends(require_delete_token)])
+async def delete_burncheck_instance(team_id: int, instance_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BurncheckInstance).where(
+        BurncheckInstance.id == instance_id, BurncheckInstance.team_id == team_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    await db.delete(instance)
     return {"ok": True}

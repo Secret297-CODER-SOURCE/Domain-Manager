@@ -4,6 +4,7 @@ cf_zones.py — базові запити до Cloudflare API.
   - cfk_... або довжина != 37  →  API Token (Bearer)
   - інакше                      →  Global API Key (X-Auth-Email + X-Auth-Key)
 """
+import asyncio
 import httpx
 from typing import Optional
 
@@ -130,12 +131,29 @@ async def fetch_dns_records(email: Optional[str], api_key: str, zone_id: str) ->
     return records
 
 
-async def get_zone_status(email: Optional[str], api_key: str, zone_id: str) -> str:
+async def get_zone_status(email: Optional[str], api_key: str, zone_id: str, *, max_retries: int = 3) -> str:
+    """Retries on 429 (honoring Retry-After) and 5xx with exponential
+    backoff — this runs across potentially thousands of zones every
+    15-20 min, so a transient rate-limit/server hiccup on one zone
+    shouldn't get reported as 'unknown' (which the caller treats as a
+    real status)."""
     headers = make_headers(email, api_key)
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{CF_API}/zones/{zone_id}", headers=headers)
-        if r.status_code == 200 and r.json().get("success"):
-            return r.json()["result"].get("status", "unknown")
+        for attempt in range(max_retries + 1):
+            r = await client.get(f"{CF_API}/zones/{zone_id}", headers=headers)
+            if r.status_code == 200 and r.json().get("success"):
+                return r.json()["result"].get("status", "unknown")
+            if attempt < max_retries and (r.status_code == 429 or r.status_code >= 500):
+                if r.status_code == 429:
+                    try:
+                        delay = float(r.headers.get("Retry-After", 2 ** attempt))
+                    except ValueError:
+                        delay = 2 ** attempt
+                else:
+                    delay = 2 ** attempt
+                await asyncio.sleep(delay)
+                continue
+            break
     return "unknown"
 
 

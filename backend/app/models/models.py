@@ -47,6 +47,7 @@ class Team(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(128), unique=True, nullable=False, index=True)
     description = Column(Text, nullable=True)
+    code = Column(String(64), unique=True, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     cloudflare_accounts = relationship("CloudflareAccount", back_populates="team", cascade="all, delete-orphan")
     keitaro_instances = relationship("KeitaroInstance", back_populates="team", cascade="all, delete-orphan")
@@ -113,6 +114,21 @@ class CnameTarget(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class BurncheckInstance(Base):
+    """A registered BurnCheck server allowed to call the /api/external
+    endpoints on behalf of one team. Each instance gets its own API key
+    (replaces the single shared EXTERNAL_API_KEY for team-scoped calls)
+    and an optional IP allowlist as an additional auth layer."""
+    __tablename__ = "burncheck_instances"
+    id = Column(Integer, primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="CASCADE"), nullable=False)
+    label = Column(String(128), nullable=False)
+    webhook_url = Column(String(512), nullable=True)
+    api_key = Column(String(128), nullable=False, unique=True)
+    allowed_ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class KeitaroDomainGroup(Base):
     __tablename__ = "keitaro_domain_groups"
     id = Column(Integer, primary_key=True)
@@ -142,6 +158,17 @@ class Domain(Base):
     name_servers = Column(String(512), nullable=True)  # comma-separated NS, e.g. "ada.ns.cf.com,bob.ns.cf.com"
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     added_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Soft-delete: zone removed from Cloudflare but the row (and its history)
+    # is kept. abuse_reason holds "<Category>: <Original Work>", e.g.
+    # "Phishing: Ziraat Bank", when the removal was abuse-driven.
+    removed_from_cf = Column(Boolean, default=False)
+    abuse_reason = Column(String(512), nullable=True)
+    # Окрема вісь від zone_status (CF-специфічний) — зовнішній сигнал від
+    # BurnCheck: домен підтверджено в списку Siberguvenlik (siberguvenlik.gov.tr).
+    # Раз True, назавжди True (звідти домени не знімають) — BurnCheck сам
+    # шле це лише один раз, при першому підтвердженні.
+    siberguvenlik_listed = Column(Boolean, default=False)
+    siberguvenlik_confirmed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     cf_account = relationship("CloudflareAccount", back_populates="domains")

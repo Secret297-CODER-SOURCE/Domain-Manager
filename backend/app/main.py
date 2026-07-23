@@ -7,7 +7,7 @@ import logging
 
 from app.db.session import engine, AsyncSessionLocal
 from app.models.models import Base
-from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api, notifications as notifications_api, payments as payments_api
+from app.api import auth, teams, domains, keitaro, spreadsheets, keepass, proxies, backup as backup_api, purchases, kuma, identities, mail, services as services_api, notes, servers as servers_api, sheet_sync, sheet_import, dynadot as dynadot_api, public as public_api, notifications as notifications_api, payments as payments_api, external as external_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,9 +25,19 @@ async def daily_sync_job():
 
 
 async def hourly_abuse_check():
-    """Runs every hour — check for suspended zones, alert in TG."""
+    """Runs every 18 min — check for suspended zones, alert in TG."""
     from app.services.telegram_bot import check_all_zones
     await check_all_zones()
+
+
+async def cf_abuse_refresh_job():
+    """Runs every hour — live-fetch CF abuse reports for all active accounts
+    and cache them. The Dashboard abuse widget and "Причини банів" stats card
+    both read that cache instead of hitting Cloudflare on every page load."""
+    from app.api.domains import refresh_cf_abuse_cache
+    async with AsyncSessionLocal() as db:
+        reports = await refresh_cf_abuse_cache(db)
+    logger.info(f"[cf_abuse_refresh] cached {len(reports)} live abuse reports")
 
 
 async def cleanup_old_logs():
@@ -384,6 +394,24 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL",
             "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider_email VARCHAR(256)",
             "ALTER TABLE remote_servers ADD COLUMN IF NOT EXISTS provider_password_enc TEXT",
+            # Soft-delete for abused/removed domains — keep row + history
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS removed_from_cf BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS abuse_reason VARCHAR(512)",
+            # BurnCheck → Domain Manager: підтвердження лістингу в Siberguvenlik
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS siberguvenlik_listed BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS siberguvenlik_confirmed_at TIMESTAMPTZ",
+            # Per-команда реєстрація BurnCheck-інстансів (webhook URL + власний
+            # API-ключ + опційний IP-вайтліст) — заміна одного глобального
+            # DOMAINGUARD_WEBHOOK_URL з .env.
+            "CREATE TABLE IF NOT EXISTS burncheck_instances ("
+            "id SERIAL PRIMARY KEY,"
+            "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,"
+            "label VARCHAR(128) NOT NULL,"
+            "webhook_url VARCHAR(512),"
+            "api_key VARCHAR(128) NOT NULL UNIQUE,"
+            "allowed_ip VARCHAR(64),"
+            "created_at TIMESTAMPTZ DEFAULT now()"
+            ")",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))
@@ -396,8 +424,16 @@ async def lifespan(app: FastAPI):
     # account. Original behaviour was daily 03:00. First run 60s after startup.
     scheduler.add_job(daily_sync_job, "interval", hours=1, id="daily_sync",
                       next_run_time=datetime.now() + timedelta(seconds=60))
-    # Hourly abuse check
-    scheduler.add_job(hourly_abuse_check, "interval", hours=1, id="abuse_check")
+    # Abuse check — every 18 min (was hourly). Zone-status checks now run
+    # per-account with bounded concurrency (see ACCOUNT_CHECK_CONCURRENCY in
+    # telegram_bot.py) + 429/5xx retry in cf_zones.get_zone_status, so a
+    # shorter interval no longer risks hammering Cloudflare.
+    scheduler.add_job(hourly_abuse_check, "interval", minutes=18, id="abuse_check")
+    # Hourly live CF abuse-reports cache refresh — Dashboard reads the cache
+    # instead of hitting Cloudflare on every page load. First run 90s after
+    # startup so the cache isn't empty for the first visitor.
+    scheduler.add_job(cf_abuse_refresh_job, "interval", hours=1, id="cf_abuse_refresh",
+                      next_run_time=datetime.now() + timedelta(seconds=90))
     # Daily log cleanup at 04:00 UTC
     scheduler.add_job(cleanup_old_logs, "cron", hour=4, minute=0, id="log_cleanup")
     # Daily stats report at 09:00 UTC (12:00 Kyiv)
@@ -414,7 +450,7 @@ async def lifespan(app: FastAPI):
                       id="payment_due_reminder")
 
     scheduler.start()
-    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, log_cleanup@04:00, expiry@08:00, server_payment@08:30, payment_due@06:00, daily_stats@09:00")
+    logger.info("Scheduler started: cf_sync@1h (full DNS), abuse_check@hourly, cf_abuse_refresh@hourly, log_cleanup@04:00, expiry@08:00, server_payment@08:30, payment_due@06:00, daily_stats@09:00")
 
     # Restore backup schedule from persisted config
     try:
@@ -483,6 +519,7 @@ app.include_router(dynadot_api.router)
 app.include_router(public_api.router)
 app.include_router(notifications_api.router)
 app.include_router(payments_api.router)
+app.include_router(external_api.router)
 
 
 # ── Backup scheduler control ──────────────────────────────────────────────

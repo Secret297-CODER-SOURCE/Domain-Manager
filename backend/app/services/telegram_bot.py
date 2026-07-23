@@ -18,6 +18,12 @@ dp = Dispatcher()
 PLATFORM_URL = "https://domain-manage.tech/"
 PLATFORM_FOOTER = f'\n\n— <a href="{PLATFORM_URL}">domain-manage.tech</a>'
 
+# How many CF accounts' zone-status sweeps run concurrently. Zones within one
+# account are still checked sequentially (they share that account's CF rate
+# limit); this just keeps one slow/rate-limited account from stalling the
+# whole sweep across all teams.
+ACCOUNT_CHECK_CONCURRENCY = 4
+
 
 def get_bot() -> Bot:
     global bot
@@ -50,86 +56,114 @@ async def notify_admins(text: str):
             logger.error(f"TG notify error to {cid}: {e}")
 
 
+async def _check_one_zone(db, domain, account, team):
+    try:
+        raw_status = await get_zone_status(
+            account.email, account.api_key, domain.zone_id
+        )
+        status_map = {
+            "active": DomainStatus.active,
+            "pending": DomainStatus.pending,
+            "paused": DomainStatus.suspended,
+        }
+        new_status = status_map.get(raw_status, DomainStatus.unknown)
+
+        if new_status == DomainStatus.suspended and domain.zone_status != DomainStatus.suspended:
+            prev_status = domain.zone_status
+            domain.zone_status = new_status
+            domain.last_checked_at = datetime.now(timezone.utc)
+
+            # Auto-delete all DNS records immediately
+            deleted_count = 0
+            dns_result = await db.execute(select(DnsRecord).where(DnsRecord.domain_id == domain.id))
+            for rec in dns_result.scalars().all():
+                if rec.cf_record_id:
+                    ok = await cf_delete_record(
+                        account.email, account.api_key, domain.zone_id, rec.cf_record_id
+                    )
+                    if ok:
+                        await db.delete(rec)
+                        deleted_count += 1
+            domain.main_record_type = None
+            domain.main_record_value = None
+
+            # Record abuse alert as already resolved + dns_deleted
+            kt_group_name = domain.keitaro_group.name if domain.keitaro_group else "—"
+            alert = AbuseAlert(
+                domain_id=domain.id,
+                previous_status=prev_status,
+                new_status=new_status,
+                dns_deleted=True,
+                resolved=True,
+            )
+            db.add(alert)
+
+            from app.services.domainguard_notify import notify_domainguard_abuse
+            asyncio.create_task(notify_domainguard_abuse(
+                team_id=team.id,
+                domain=domain.name,
+                cf_account_email=account.email,
+                severity="high",
+                category="suspended",
+                message=f"Zone suspended, DNS records deleted ({deleted_count})",
+            ))
+
+            # Notify all admins (info only, no buttons needed)
+            text = (
+                f"<b>[ABUSE / SUSPENDED — DNS видалено]</b>\n\n"
+                f"Домен: <code>{domain.name}</code>\n"
+                f"Команда: <b>{team.name}</b>\n"
+                f"CF акаунт: <b>{account.name}</b>\n"
+                f"Група KT: <b>{kt_group_name}</b>\n"
+                f"Видалено DNS записів: <b>{deleted_count}</b>"
+            )
+            asyncio.create_task(notify_admins(text))
+
+        elif domain.zone_status != new_status:
+            prev_status = domain.zone_status
+            domain.zone_status = new_status
+            domain.last_checked_at = datetime.now(timezone.utc)
+
+            if new_status == DomainStatus.active and prev_status == DomainStatus.suspended:
+                # Domain recovered
+                alert = AbuseAlert(
+                    domain_id=domain.id,
+                    previous_status=DomainStatus.suspended,
+                    new_status=new_status,
+                )
+                db.add(alert)
+
+    except Exception as e:
+        logger.error(f"Error checking zone {domain.name}: {e}")
+
+
+async def _check_account_zones(sem: asyncio.Semaphore, account_id: int):
+    """One CF account's zones, checked sequentially (they share that
+    account's CF rate limit) in their own DB session — runs concurrently
+    with other accounts' sweeps, gated by `sem`."""
+    async with sem:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Domain, CloudflareAccount, Team)
+                .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
+                .join(Team, CloudflareAccount.team_id == Team.id)
+                .where(CloudflareAccount.id == account_id, CloudflareAccount.is_active == True)
+            )
+            for domain, account, team in result.all():
+                await _check_one_zone(db, domain, account, team)
+            await db.commit()
+
+
 async def check_all_zones():
     if not settings.TELEGRAM_BOT_TOKEN:
         return
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Domain, CloudflareAccount, Team)
-            .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
-            .join(Team, CloudflareAccount.team_id == Team.id)
-            .where(CloudflareAccount.is_active == True)
-        )
-        rows = result.all()
-        for domain, account, team in rows:
-            try:
-                raw_status = await get_zone_status(
-                    account.email, account.api_key, domain.zone_id
-                )
-                status_map = {
-                    "active": DomainStatus.active,
-                    "pending": DomainStatus.pending,
-                    "paused": DomainStatus.suspended,
-                }
-                new_status = status_map.get(raw_status, DomainStatus.unknown)
+        account_ids = (await db.execute(
+            select(CloudflareAccount.id).where(CloudflareAccount.is_active == True)
+        )).scalars().all()
 
-                if new_status == DomainStatus.suspended and domain.zone_status != DomainStatus.suspended:
-                    prev_status = domain.zone_status
-                    domain.zone_status = new_status
-                    domain.last_checked_at = datetime.now(timezone.utc)
-
-                    # Auto-delete all DNS records immediately
-                    deleted_count = 0
-                    dns_result = await db.execute(select(DnsRecord).where(DnsRecord.domain_id == domain.id))
-                    for rec in dns_result.scalars().all():
-                        if rec.cf_record_id:
-                            ok = await cf_delete_record(
-                                account.email, account.api_key, domain.zone_id, rec.cf_record_id
-                            )
-                            if ok:
-                                await db.delete(rec)
-                                deleted_count += 1
-                    domain.main_record_type = None
-                    domain.main_record_value = None
-
-                    # Record abuse alert as already resolved + dns_deleted
-                    kt_group_name = domain.keitaro_group.name if domain.keitaro_group else "—"
-                    alert = AbuseAlert(
-                        domain_id=domain.id,
-                        previous_status=prev_status,
-                        new_status=new_status,
-                        dns_deleted=True,
-                        resolved=True,
-                    )
-                    db.add(alert)
-
-                    # Notify all admins (info only, no buttons needed)
-                    text = (
-                        f"<b>[ABUSE / SUSPENDED — DNS видалено]</b>\n\n"
-                        f"Домен: <code>{domain.name}</code>\n"
-                        f"Команда: <b>{team.name}</b>\n"
-                        f"CF акаунт: <b>{account.name}</b>\n"
-                        f"Група KT: <b>{kt_group_name}</b>\n"
-                        f"Видалено DNS записів: <b>{deleted_count}</b>"
-                    )
-                    asyncio.create_task(notify_admins(text))
-
-                elif domain.zone_status != new_status:
-                    domain.zone_status = new_status
-                    domain.last_checked_at = datetime.now(timezone.utc)
-
-                    if new_status == DomainStatus.active and domain.zone_status == DomainStatus.suspended:
-                        # Domain recovered
-                        alert = AbuseAlert(
-                            domain_id=domain.id,
-                            previous_status=DomainStatus.suspended,
-                            new_status=new_status,
-                        )
-                        db.add(alert)
-
-            except Exception as e:
-                logger.error(f"Error checking zone {domain.name}: {e}")
-        await db.commit()
+    sem = asyncio.Semaphore(ACCOUNT_CHECK_CONCURRENCY)
+    await asyncio.gather(*(_check_account_zones(sem, acc_id) for acc_id in account_ids))
 
 
 # ── Bot command handlers ───────────────────────────────────────────────────

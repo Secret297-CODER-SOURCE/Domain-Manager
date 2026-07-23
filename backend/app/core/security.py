@@ -2,14 +2,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 import bcrypt
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, Header, status
+from fastapi import Depends, HTTPException, Header, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.session import get_db
-from app.models.models import User, UserRole
+from app.models.models import User, UserRole, BurncheckInstance
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -44,6 +44,35 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != UserRole.admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+
+async def require_external_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[BurncheckInstance]:
+    """Gate for service-to-service endpoints (e.g. BurnCheck pushing/pulling
+    domain state). Accepts either:
+    - the static shared EXTERNAL_API_KEY (legacy, unrestricted — returns None), or
+    - a per-team key from burncheck_instances, optionally locked to one
+      source IP (checked against X-Forwarded-For / client host as an
+      ADDITIONAL layer on top of the key, not instead of it).
+    Returns the matched BurncheckInstance (so callers can verify the
+    instance's team matches the {code} in the URL), or None for the shared key."""
+    if x_api_key and settings.EXTERNAL_API_KEY and x_api_key == settings.EXTERNAL_API_KEY:
+        return None
+    if x_api_key:
+        result = await db.execute(select(BurncheckInstance).where(BurncheckInstance.api_key == x_api_key))
+        instance = result.scalar_one_or_none()
+        if instance:
+            if instance.allowed_ip:
+                forwarded = request.headers.get("x-forwarded-for")
+                client_ip = (forwarded.split(",")[0].strip() if forwarded
+                             else (request.client.host if request.client else None))
+                if client_ip != instance.allowed_ip:
+                    raise HTTPException(status_code=401, detail="invalid api key")
+            return instance
+    raise HTTPException(status_code=401, detail="invalid api key")
 
 
 async def require_delete_token(

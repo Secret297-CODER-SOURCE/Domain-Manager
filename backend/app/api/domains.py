@@ -481,8 +481,10 @@ async def bulk_abuse_delete(data: BulkAbuseDeleteRequest, db: AsyncSession = Dep
 
 @router.delete("/{domain_id}/full-delete", dependencies=[Depends(require_delete_token)])
 async def full_delete_from_cf(domain_id: int, db: AsyncSession = Depends(get_db)):
-    """Remove zone from Cloudflare. Domain row is kept (soft-deleted) — this
-    is a manual single-domain action with no CF abuse-report context to attach."""
+    """Remove zone from Cloudflare. Domain row is kept (soft-deleted); if CF
+    has a live abuse report for this domain, it's captured as abuse_reason
+    before the zone is deleted (once gone, the report may no longer be
+    fetchable, so this must happen first)."""
     result = await db.execute(
         select(Domain, CloudflareAccount, Team)
         .join(CloudflareAccount, Domain.cf_account_id == CloudflareAccount.id)
@@ -493,9 +495,17 @@ async def full_delete_from_cf(domain_id: int, db: AsyncSession = Depends(get_db)
     if not row:
         raise HTTPException(404, "Domain not found")
     domain, account, team = row
+
+    reason = None
+    try:
+        reports = await _fetch_cf_abuse(account) if account.is_active else []
+        reason = next((r["reason"] for r in reports if (r.get("domain") or "").lower() == domain.name.lower()), None)
+    except Exception:
+        pass
+
     ok = await delete_full_zone_from_cf(account.email, account.api_key, domain.zone_id)
     db.add(ActionLog(action="full_delete_cf", domain=domain.name, details=f"manual|{team.name}|{account.name}"))
-    await soft_delete_domain(db, domain)
+    await soft_delete_domain(db, domain, reason)
     await db.commit()
 
     from app.services.domainguard_notify import notify_domainguard_abuse
@@ -503,7 +513,7 @@ async def full_delete_from_cf(domain_id: int, db: AsyncSession = Depends(get_db)
         team_id=team.id,
         domain=domain.name,
         cf_account_email=account.email,
-        severity="medium",
+        severity="high" if reason else "medium",
         category="removed",
         message="Zone removed from Cloudflare (manual)",
     ))

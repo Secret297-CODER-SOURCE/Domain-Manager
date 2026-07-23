@@ -426,6 +426,9 @@ async def lifespan(app: FastAPI):
             # Soft-delete for teams — "deleting" a team must never
             # cascade-hard-delete its CF accounts/domains/DNS history.
             "ALTER TABLE teams ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE NOT NULL",
+            # Persisted live CF abuse-report count per domain (refreshed
+            # hourly, see cf_abuse_refresh_job / refresh_cf_abuse_cache).
+            "ALTER TABLE domains ADD COLUMN IF NOT EXISTS cf_abuse_report_count INTEGER DEFAULT 0 NOT NULL",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))

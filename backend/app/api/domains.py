@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func, delete
+from sqlalchemy import select, and_, func, delete, update
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone
@@ -196,7 +196,7 @@ async def list_domains(
         d.keitaro_group_name = kt_group.name if kt_group else None
         d.keitaro_instance_name = kt_inst.name if kt_inst else None
         d.added_by_username = added_by.username if added_by else None
-        d.abuse_count = abuse_counts.get(domain.id, 0)
+        d.abuse_count = abuse_counts.get(domain.id, 0) + (domain.cf_abuse_report_count or 0)
         out.append(d)
     return out
 
@@ -1292,7 +1292,11 @@ _cf_abuse_lock = _asyncio.Lock()
 
 
 async def refresh_cf_abuse_cache(db: AsyncSession) -> list[dict]:
-    """Live-fetch abuse reports for all active CF accounts and cache them."""
+    """Live-fetch abuse reports for all active CF accounts, cache them, and
+    persist a per-domain count onto domains.cf_abuse_report_count so it
+    survives restarts and shows up in the domains list (not just this
+    in-memory cache). Counts are fully recomputed each run — domains no
+    longer reported drop back to 0."""
     async with _cf_abuse_lock:
         result = await db.execute(
             select(CloudflareAccount).where(CloudflareAccount.is_active == True)
@@ -1303,6 +1307,27 @@ async def refresh_cf_abuse_cache(db: AsyncSession) -> list[dict]:
         combined.sort(key=lambda x: x.get("created_at") or "", reverse=True)
         _cf_abuse_cache["reports"] = combined
         _cf_abuse_cache["updated_at"] = datetime.now(timezone.utc)
+
+        counts: dict[tuple[int, str], int] = {}
+        for account, reports in zip(accounts, all_reports):
+            for r in reports:
+                name = (r.get("domain") or "").lower().strip()
+                if not name or name == "unknown":
+                    continue
+                key = (account.id, name)
+                counts[key] = counts.get(key, 0) + 1
+
+        await db.execute(
+            update(Domain).where(Domain.cf_account_id.in_([a.id for a in accounts]))
+            .values(cf_abuse_report_count=0)
+        )
+        for (account_id, name), cnt in counts.items():
+            await db.execute(
+                update(Domain)
+                .where(Domain.cf_account_id == account_id, func.lower(Domain.name) == name)
+                .values(cf_abuse_report_count=cnt)
+            )
+        await db.commit()
         return combined
 
 

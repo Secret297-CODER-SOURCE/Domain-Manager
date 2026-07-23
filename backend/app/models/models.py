@@ -173,6 +173,11 @@ class Domain(Base):
     # шле це лише один раз, при першому підтвердженні.
     siberguvenlik_listed = Column(Boolean, default=False)
     siberguvenlik_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    # Live count of Cloudflare abuse reports currently open for this zone —
+    # refreshed hourly by cf_abuse_refresh_job alongside the in-memory cache
+    # (see api/domains.py:refresh_cf_abuse_cache). Distinct from abuse_count
+    # in DomainOut, which also folds in AbuseAlert (our own suspend-history).
+    cf_abuse_report_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     cf_account = relationship("CloudflareAccount", back_populates="domains")

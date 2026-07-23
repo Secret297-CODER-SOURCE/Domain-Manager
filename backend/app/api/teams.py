@@ -1,7 +1,7 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from pydantic import BaseModel
 from typing import Optional
 from app.db.session import get_db
@@ -84,6 +84,7 @@ class TeamOut(BaseModel):
     name: str
     description: Optional[str]
     code: Optional[str] = None
+    is_active: bool = True
     class Config:
         from_attributes = True
 
@@ -241,13 +242,28 @@ async def update_team(team_id: int, data: TeamUpdate, db: AsyncSession = Depends
 @router.delete("/{team_id}", dependencies=[Depends(require_delete_token)])
 async def delete_team(team_id: int, db: AsyncSession = Depends(get_db),
                        user: User = Depends(get_current_user)):
+    """Soft-delete only: a hard delete here would cascade through every CF
+    account the team owns and wipe every one of their domains (and DNS
+    history) with no way back. Deactivating instead keeps everything intact
+    and reversible — reactivate via PATCH is_active=true."""
     result = await db.execute(select(Team).where(Team.id == team_id))
     team = result.scalar_one_or_none()
     if not team:
         raise HTTPException(404, "Team not found")
-    log_action(db, "team_delete", user=user, target=team.name)
-    await db.delete(team)
-    return {"ok": True}
+    from app.models.models import CloudflareAccount as _CFAccount, Domain as _Domain
+    cf_count = (await db.execute(
+        select(func.count(_CFAccount.id)).where(_CFAccount.team_id == team_id)
+    )).scalar_one()
+    domain_count = (await db.execute(
+        select(func.count(_Domain.id))
+        .join(_CFAccount, _Domain.cf_account_id == _CFAccount.id)
+        .where(_CFAccount.team_id == team_id)
+    )).scalar_one()
+    log_action(db, "team_delete", user=user, target=team.name,
+               details={"mode": "soft", "cf_accounts_affected": cf_count, "domains_affected": domain_count})
+    team.is_active = False
+    await db.commit()
+    return {"ok": True, "cf_accounts_affected": cf_count, "domains_affected": domain_count}
 
 @router.get("/{team_id}/cf-accounts", response_model=list[CFAccountOut])
 async def list_cf_accounts(team_id: int, db: AsyncSession = Depends(get_db), _=Depends(get_current_user)):
@@ -332,14 +348,23 @@ async def update_cf_account(team_id: int, account_id: int, data: CFAccountUpdate
 @router.delete("/{team_id}/cf-accounts/{account_id}", dependencies=[Depends(require_delete_token)])
 async def delete_cf_account(team_id: int, account_id: int, db: AsyncSession = Depends(get_db),
                              user: User = Depends(get_current_user)):
+    """Soft-delete only: a hard delete here cascades (FK ondelete=CASCADE)
+    and permanently wipes every Domain row (+ DNS history) under this
+    account with no way back. Deactivating instead keeps everything
+    intact — domains stay exactly as they were, reactivate via PATCH."""
     result = await db.execute(select(CloudflareAccount).where(CloudflareAccount.id == account_id, CloudflareAccount.team_id == team_id))
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(404, "Account not found")
+    from app.models.models import Domain as _Domain
+    domain_count = (await db.execute(
+        select(func.count(_Domain.id)).where(_Domain.cf_account_id == account_id)
+    )).scalar_one()
     log_action(db, "cf_account_delete", user=user, target=account.name,
-               details={"team_id": team_id, "email": account.email})
-    await db.delete(account)
-    return {"ok": True}
+               details={"team_id": team_id, "email": account.email, "mode": "soft", "domains_affected": domain_count})
+    account.is_active = False
+    await db.commit()
+    return {"ok": True, "domains_affected": domain_count}
 
 
 # ── CF account detail + cleanup ───────────────────────────────────────────

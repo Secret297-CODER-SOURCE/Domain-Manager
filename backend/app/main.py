@@ -41,13 +41,24 @@ async def cf_abuse_refresh_job():
 
 
 async def cleanup_old_logs():
-    """Runs daily — delete ActionLog entries older than 7 days."""
+    """Runs daily — delete ActionLog entries older than 7 days.
+    Destructive actions (team/cf-account/domain removal) are kept for 180
+    days instead — a 7-day trail on the one thing you'd actually want to
+    investigate later ("who removed this and why") isn't enough."""
     from sqlalchemy import delete, text
     from app.models.models import ActionLog
+    destructive_actions = ("team_delete", "cf_account_delete", "full_delete_cf")
     async with AsyncSessionLocal() as db:
         await db.execute(
             delete(ActionLog).where(
-                ActionLog.created_at < text("NOW() - INTERVAL '7 days'")
+                ActionLog.created_at < text("NOW() - INTERVAL '7 days'"),
+                ActionLog.action.notin_(destructive_actions),
+            )
+        )
+        await db.execute(
+            delete(ActionLog).where(
+                ActionLog.created_at < text("NOW() - INTERVAL '180 days'"),
+                ActionLog.action.in_(destructive_actions),
             )
         )
         await db.commit()
@@ -412,6 +423,9 @@ async def lifespan(app: FastAPI):
             "allowed_ip VARCHAR(64),"
             "created_at TIMESTAMPTZ DEFAULT now()"
             ")",
+            # Soft-delete for teams — "deleting" a team must never
+            # cascade-hard-delete its CF accounts/domains/DNS history.
+            "ALTER TABLE teams ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE NOT NULL",
         ]:
             try:
                 await conn.execute(__import__('sqlalchemy').text(stmt))

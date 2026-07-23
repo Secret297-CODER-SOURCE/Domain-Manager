@@ -48,6 +48,10 @@ class Team(Base):
     name = Column(String(128), unique=True, nullable=False, index=True)
     description = Column(Text, nullable=True)
     code = Column(String(64), unique=True, nullable=True, index=True)
+    # Soft-delete: "removing" a team must never cascade-hard-delete its CF
+    # accounts/domains (and their DNS history). is_active=False just hides
+    # it from the active list; the row and everything under it survives.
+    is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     cloudflare_accounts = relationship("CloudflareAccount", back_populates="team", cascade="all, delete-orphan")
     keitaro_instances = relationship("KeitaroInstance", back_populates="team", cascade="all, delete-orphan")
